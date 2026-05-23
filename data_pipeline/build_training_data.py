@@ -6,7 +6,7 @@ waypoints from motion), and outputs a JSONL file compatible with model.py's
 JsonTrackingDataset.
 
 Usage:
-    python scripts/car/build_training_data.py --input data/collected --output data/car_train.jsonl
+    python data_pipeline/build_training_data.py --input data/collected --output data/car_train.jsonl
 """
 
 import argparse
@@ -14,14 +14,17 @@ import cv2
 import json
 import math
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
+
 try:
     from car_hardware import motor_to_action
 except ImportError:
-    from scripts.car.car_hardware import motor_to_action
+    from car_runtime.car_hardware import motor_to_action
 
 
 def estimate_target_from_frame(frame):

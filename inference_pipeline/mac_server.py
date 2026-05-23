@@ -2,10 +2,11 @@
 """Mac inference server — receives frames from Pi, runs PFEM-Harness, sends commands.
 
 Run on your Mac/PC:
-    python scripts/car/mac_server.py --ckpt ckpts_pfem/pfem_epoch0.pt --port 9999
+    python inference_pipeline/mac_server.py --ckpt ckpts_pfem/pfem_epoch0.pt --port 9999
 """
 
 import argparse
+import os
 import socket
 import sys
 import time
@@ -14,18 +15,33 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
     from car_hardware import command_from_key, waypoint_to_motor
     from car_protocol import recv_jpeg_frame, recv_json, send_json
 except ImportError:
-    from scripts.car.car_hardware import command_from_key, waypoint_to_motor
-    from scripts.car.car_protocol import recv_jpeg_frame, recv_json, send_json
+    from car_runtime.car_hardware import command_from_key, waypoint_to_motor
+    from car_runtime.car_protocol import recv_jpeg_frame, recv_json, send_json
 
 
-def load_model(ckpt_path, device):
+def resolve_opentrackvla_root(root_arg):
+    root = root_arg or os.environ.get("OPENTRACKVLA_ROOT")
+    if root is None:
+        raise RuntimeError(
+            "Full model mode requires --opentrackvla_root or OPENTRACKVLA_ROOT. "
+            "Use --mock_control for protocol testing without OpenTrackVLA."
+        )
+    root_path = Path(root).expanduser().resolve()
+    if not (root_path / "model.py").exists():
+        raise FileNotFoundError(f"OpenTrackVLA root not found or missing model.py: {root_path}")
+    return root_path
+
+
+def load_model(ckpt_path, device, opentrackvla_root):
     import torch
+
+    sys.path.insert(0, str(opentrackvla_root))
     from model import OpenTrackVLA, ModelConfig
     from harness.harness_wrapper import PFEMHarness
 
@@ -101,6 +117,8 @@ def main():
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--port", type=int, default=9999)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--opentrackvla_root", default=None,
+                    help="Path to the full OpenTrackVLA repo for non-mock model inference.")
     ap.add_argument("--mock_control", action="store_true",
                     help="Do not load the model; return a fixed safe command for protocol testing.")
     ap.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
@@ -113,8 +131,9 @@ def main():
         model = None
     else:
         import torch
+        opentrackvla_root = resolve_opentrackvla_root(args.opentrackvla_root)
         device = torch.device(args.device or default_device())
-        model = load_model(args.ckpt, device)
+        model = load_model(args.ckpt, device, opentrackvla_root)
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

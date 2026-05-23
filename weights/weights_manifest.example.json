@@ -1,0 +1,16 @@
+{
+  "opentrackvla_root": "/absolute/path/to/OpenTrackVLA",
+  "base_model": {
+    "name": "opentrackvla-qwen06b",
+    "local_dir": "/absolute/path/to/OpenTrackVLA/ckpts_hf/opentrackvla-qwen06b",
+    "role": "base OpenTrackVLA Qwen0.6B checkpoint"
+  },
+  "pfem_checkpoint": {
+    "local_path": "/absolute/path/to/OpenTrackVLA/ckpts_pfem/pfem_epoch3.pt",
+    "role": "optional PFEM-Harness checkpoint"
+  },
+  "vision_encoders": {
+    "role": "SigLIP/DINOv2 tokenization through OpenTrackVLA cache code",
+    "local_cache": "managed by Hugging Face / OpenTrackVLA"
+  }
+}

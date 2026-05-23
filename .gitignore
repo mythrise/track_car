@@ -17,3 +17,4 @@ ckpts*/
 *.png
 world_rollouts/
 sim_data/
+weights/*.local.json

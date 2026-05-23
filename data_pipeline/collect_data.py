@@ -2,7 +2,7 @@
 """Data collection script — records frames + motor commands while human teleops.
 
 Run on Raspberry Pi while controlling the car via APP/keyboard:
-    python3 collect_data.py --episode_name ep001 --instruction "follow the person in red"
+    python3 data_pipeline/collect_data.py --episode_name ep001 --instruction "follow the person in red"
 
 Output: data/collected/<episode_name>/frame_XXXXXX.jpg + meta_XXXXXX.json
 """
@@ -16,11 +16,14 @@ import sys
 import termios
 import time
 import tty
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
     from car_hardware import CarHardware, command_from_key
 except ImportError:
-    from scripts.car.car_hardware import CarHardware, command_from_key
+    from car_runtime.car_hardware import CarHardware, command_from_key
 
 
 def read_key_nonblocking():
@@ -120,6 +123,7 @@ def main():
             "n_frames": frame_idx,
             "width": args.width,
             "height": args.height,
+            "fps": args.fps,
             "teleop": args.teleop,
         }
         with open(os.path.join(save_dir, "episode.json"), "w") as f:

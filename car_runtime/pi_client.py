@@ -2,7 +2,7 @@
 """Raspberry Pi C3 car client — captures frames, sends to Mac server, executes commands.
 
 Run on the Raspberry Pi:
-    python3 pi_client.py --server_ip 192.168.12.100 --server_port 9999
+    python3 car_runtime/pi_client.py --server_ip 192.168.12.100 --server_port 9999
 """
 
 import argparse
@@ -14,8 +14,8 @@ try:
     from car_hardware import CarHardware
     from car_protocol import recv_json, send_jpeg_frame, send_json
 except ImportError:
-    from scripts.car.car_hardware import CarHardware
-    from scripts.car.car_protocol import recv_json, send_jpeg_frame, send_json
+    from car_runtime.car_hardware import CarHardware
+    from car_runtime.car_protocol import recv_json, send_jpeg_frame, send_json
 
 
 def setup_hardware(dry_run=False):

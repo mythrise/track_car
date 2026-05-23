@@ -13,7 +13,7 @@ import time
 try:
     from car_hardware import CarHardware, command_from_key
 except ImportError:
-    from scripts.car.car_hardware import CarHardware, command_from_key
+    from car_runtime.car_hardware import CarHardware, command_from_key
 
 
 KEY_BY_MOVE = {

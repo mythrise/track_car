@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Track car training sample",
+  "type": "object",
+  "required": ["current", "images", "instruction", "waypoints", "actions"],
+  "properties": {
+    "episode": {"type": "string"},
+    "frame_idx": {"type": "integer"},
+    "current": {"type": "string"},
+    "images": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "instruction": {"type": "string"},
+    "waypoints": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"type": "number"},
+        "minItems": 3,
+        "maxItems": 3
+      }
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"type": "number"},
+        "minItems": 3,
+        "maxItems": 3
+      }
+    },
+    "motors": {
+      "type": ["array", "null"],
+      "items": {"type": "integer"}
+    },
+    "command": {"type": ["string", "null"]},
+    "polar_theta_idx": {"type": "integer"},
+    "polar_dist_idx": {"type": "integer"},
+    "polar_invalid": {"type": "number"}
+  }
+}
