@@ -28,6 +28,74 @@ That was not the full data pipeline. This version adds the project structure
 needed to make the data pipeline, inference pipeline, and weight management
 explicit.
 
+## Missing Weights And Local Files
+
+This repository does not contain the large model/data artifacts needed for
+real TrackVLA/PFEM inference. Mock control works without these files; real
+model control does not.
+
+### Download / Prepare Yourself
+
+| Item | Required for | Suggested local path | Notes |
+| --- | --- | --- | --- |
+| Full OpenTrackVLA repo | full model inference source code | `/Users/mythrise/科研实习/OpenTrackVLA` | Not vendored into this repo. Pass it with `--opentrackvla_root` or `OPENTRACKVLA_ROOT`. |
+| `omlab/opentrackvla-qwen06b` | official OpenTrackVLA 0.6B checkpoint / baseline planner | `/Users/mythrise/科研实习/OpenTrackVLA/ckpts_hf/opentrackvla-qwen06b` | Contains `model.safetensors`, `config.json`, and HF wrapper files. Around 1.2 GB locally. |
+| `Qwen/Qwen3-0.6B` | LLM backbone used by native `model.py` and PFEM wrapper | Hugging Face cache or a local model dir | Transformers can auto-download it, but pre-download it if the Mac will run offline. |
+| `facebook/dinov3-vits16-pretrain-lvd1689m` | official DINOv3 visual tokens | local DINOv3 dir, then set `DINOV3_MODEL_PATH=/path/to/dinov3` | Gated Hugging Face model; request access officially. |
+| `google/siglip-so400m-patch14-384` | SigLIP visual tokens | Hugging Face cache or local model dir | Used together with DINOv3 in OpenTrackVLA `VisionFeatureCacher`. |
+| `ckpts_pfem/pfem_epoch*.pt` | PFEM-Harness car-control checkpoint | `/Users/mythrise/科研实习/OpenTrackVLA/ckpts_pfem/pfem_epoch3.pt` | Not downloaded from this repo; train it with OpenTrackVLA `scripts/train_pfem.py` or copy from your experiment machine. |
+| `ckpts/model_epoch*.pt` | legacy/custom OpenTrackVLA training checkpoint | `/Users/mythrise/科研实习/OpenTrackVLA/ckpts/` | Optional alternative when evaluating custom checkpoints. |
+
+Example downloads:
+
+```bash
+cd /Users/mythrise/科研实习/OpenTrackVLA
+
+hf download omlab/opentrackvla-qwen06b \
+  --local-dir ckpts_hf/opentrackvla-qwen06b
+
+hf download Qwen/Qwen3-0.6B \
+  --local-dir ckpts_hf/qwen3-0.6b
+
+hf download google/siglip-so400m-patch14-384 \
+  --local-dir ckpts_hf/siglip-so400m-patch14-384
+
+# DINOv3 is gated. After Hugging Face access is approved:
+hf download facebook/dinov3-vits16-pretrain-lvd1689m \
+  --local-dir ckpts_hf/dinov3-vits16-pretrain-lvd1689m
+export DINOV3_MODEL_PATH=/Users/mythrise/科研实习/OpenTrackVLA/ckpts_hf/dinov3-vits16-pretrain-lvd1689m
+```
+
+Then create a local manifest:
+
+```bash
+cp weights/weights_manifest.example.json weights/weights_manifest.local.json
+# edit weights/weights_manifest.local.json to match your machine
+python weights/resolve_weights.py --manifest weights/weights_manifest.local.json
+```
+
+### Not Uploaded To GitHub
+
+These are intentionally excluded:
+
+```text
+OpenTrackVLA/ full source tree
+ckpts_hf/ downloaded Hugging Face model snapshots
+ckpts/ and ckpts_pfem/ training checkpoints
+*.pt, *.pth, *.safetensors model files
+data/collected/ raw car episodes
+data/*.jsonl training/evaluation data
+sim_data/, world_rollouts/, Habitat/EVT-Bench outputs
+*.jpg, *.jpeg, *.png, *.mp4, *.mov, *.avi media files
+weights/*.local.json machine-specific paths
+.env, venv/, .venv/, __pycache__/
+Raspberry Pi vendor files such as z_uart.py
+```
+
+For real Raspberry Pi motor execution, `car_runtime/car_hardware.py` also
+expects the vendor UART module `z_uart.py`, `pigpio`, and the `pigpiod` daemon
+on the Pi. Without them, the code falls back to dry-run behavior.
+
 ## Pipelines
 
 ### 1. Car Runtime

@@ -27,6 +27,10 @@ def check_path(label: str, path_value: str | None, required: bool) -> bool:
     return ok or not required
 
 
+def weight_path(item: dict) -> str | None:
+    return item.get("local_dir") or item.get("local_path") or item.get("local_cache")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
@@ -44,13 +48,22 @@ def main() -> None:
     manifest = load_manifest(Path(args.manifest))
     checks = [
         check_path("opentrackvla_root", manifest.get("opentrackvla_root"), required=True),
-        check_path("base_model.local_dir", manifest.get("base_model", {}).get("local_dir"), required=True),
-        check_path(
-            "pfem_checkpoint.local_path",
-            manifest.get("pfem_checkpoint", {}).get("local_path"),
-            required=False,
-        ),
     ]
+
+    if "weights" in manifest:
+        for name, item in manifest["weights"].items():
+            checks.append(
+                check_path(f"weights.{name}", weight_path(item), required=bool(item.get("required")))
+            )
+    else:
+        checks.extend([
+            check_path("base_model.local_dir", manifest.get("base_model", {}).get("local_dir"), required=True),
+            check_path(
+                "pfem_checkpoint.local_path",
+                manifest.get("pfem_checkpoint", {}).get("local_path"),
+                required=False,
+            ),
+        ])
 
     if not all(checks) and not args.allow_missing:
         raise SystemExit(1)

@@ -29,8 +29,13 @@ Raspberry Pi executor
 | Weight | Role |
 | --- | --- |
 | `opentrackvla-qwen06b` | Base OpenTrackVLA Qwen0.6B planner checkpoint. |
+| `Qwen/Qwen3-0.6B` | Native LLM backbone loaded by OpenTrackVLA `model.py`. |
 | `pfem_epoch*.pt` | PFEM-Harness checkpoint trained on collected/sim data. |
-| vision encoder weights | SigLIP/DINOv2 weights used by OpenTrackVLA tokenization. |
+| `facebook/dinov3-vits16-pretrain-lvd1689m` | Official DINOv3 visual tower; gated on Hugging Face. |
+| `google/siglip-so400m-patch14-384` | SigLIP visual tower used with DINOv3. |
+
+See `weights/README.md` for the exact download commands and the list of large
+files that are intentionally not uploaded to GitHub.
 
 ## Runtime Contract
 
