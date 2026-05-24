@@ -132,6 +132,3 @@ world_rollouts/
 *.avi
 weights/*.local.json
 ```
-
-Raspberry Pi vendor files such as `z_uart.py` are also not included. Put them
-on the Pi next to the runtime code, or install them in the Pi Python path.

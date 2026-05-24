@@ -9,6 +9,8 @@ testing.
 | --- | --- |
 | `pi_client.py` | Captures camera frames, sends them to the Mac server, receives command JSON, executes motors and pan/tilt. |
 | `car_hardware.py` | Wraps vendor UART motor commands and pigpio pan/tilt PWM. |
+| `uart_transport.py` | Opens the Raspberry Pi UART and sends vendor motor strings with pyserial. |
+| `hardware_check.py` | Checks UART and pigpio availability before real movement. |
 | `car_protocol.py` | Shared length-prefixed TCP protocol. |
 | `move_test.py` | Bounded single-action smoke test. |
 
@@ -22,6 +24,13 @@ python3 car_runtime/pi_client.py \
 ```
 
 ## Direct Motor Test
+
+Check runtime dependencies:
+
+```bash
+python3 car_runtime/hardware_check.py
+python3 car_runtime/hardware_check.py --open_uart
+```
 
 Dry run:
 
@@ -37,24 +46,42 @@ python3 car_runtime/move_test.py --move forward --speed 200 --duration 0.3 --exe
 
 Keep the car lifted or in a clear low-speed area before using `--execute`.
 
+If your Raspberry Pi uses a different UART device:
+
+```bash
+python3 car_runtime/move_test.py \
+  --move forward \
+  --speed 120 \
+  --duration 0.2 \
+  --execute \
+  --uart_port /dev/serial0
+```
+
 ## Hardware Dependencies For Real Movement
 
 Dry-run mode works without motor hardware dependencies. Real movement requires:
 
 ```text
-pigpio
-running pigpiod daemon
-vendor z_uart.py
+python3-serial or pyserial
+UART device such as /dev/ttyAMA0 or /dev/serial0
+pigpio and pigpiod only if pan/tilt servos are used
 ```
 
-Install/start pigpio on Raspberry Pi:
+Install runtime packages on Raspberry Pi:
 
 ```bash
 sudo apt update
-sudo apt install -y pigpio python3-pigpio
+sudo apt install -y python3-serial pigpio python3-pigpio
+sudo usermod -aG dialout $USER
 sudo systemctl enable pigpiod
 sudo systemctl start pigpiod
 ```
 
-Put the vendor `z_uart.py` file next to `car_runtime/` or anywhere in
-`PYTHONPATH`. Without it, use `--dry_run`.
+After changing the `dialout` group, log out and back in, or reboot. If
+`hardware_check.py --open_uart` still cannot open the port, enable the serial
+interface with `sudo raspi-config`: disable serial login shell, enable serial
+hardware.
+
+The project now sends the same UART protocol shown in the vendor infrared
+remote example directly through `uart_transport.py`; a separate vendor
+`z_uart.py` file is no longer required for our runtime.

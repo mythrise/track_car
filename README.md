@@ -89,12 +89,13 @@ sim_data/, world_rollouts/, Habitat/EVT-Bench outputs
 *.jpg, *.jpeg, *.png, *.mp4, *.mov, *.avi media files
 weights/*.local.json machine-specific paths
 .env, venv/, .venv/, __pycache__/
-Raspberry Pi vendor files such as z_uart.py
 ```
 
-For real Raspberry Pi motor execution, `car_runtime/car_hardware.py` also
-expects the vendor UART module `z_uart.py`, `pigpio`, and the `pigpiod` daemon
-on the Pi. Without them, the code falls back to dry-run behavior.
+For real Raspberry Pi motor execution, `car_runtime/uart_transport.py` sends
+the same UART strings used in the vendor infrared remote example. Install
+`python3-serial` on the Pi and verify the UART with
+`python3 car_runtime/hardware_check.py --open_uart`. `pigpio`/`pigpiod` are
+only required for pan/tilt servo control.
 
 ## Pipelines
 

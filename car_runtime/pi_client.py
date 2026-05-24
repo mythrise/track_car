@@ -18,8 +18,8 @@ except ImportError:
     from car_runtime.car_protocol import recv_json, send_jpeg_frame, send_json
 
 
-def setup_hardware(dry_run=False):
-    return CarHardware(reset_servos=True, dry_run=dry_run)
+def setup_hardware(dry_run=False, uart_port=None, reset_servos=False):
+    return CarHardware(reset_servos=reset_servos, dry_run=dry_run, uart_port=uart_port)
 
 
 def main():
@@ -32,9 +32,15 @@ def main():
     ap.add_argument("--timeout", type=float, default=0.75)
     ap.add_argument("--jpeg_quality", type=int, default=70)
     ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--uart_port", default=None, help="UART device, for example /dev/ttyAMA0 or /dev/serial0.")
+    ap.add_argument("--reset_servos", action="store_true", help="Reset pan/tilt servos on startup.")
     args = ap.parse_args()
 
-    hardware = setup_hardware(dry_run=args.dry_run)
+    hardware = setup_hardware(
+        dry_run=args.dry_run,
+        uart_port=args.uart_port,
+        reset_servos=args.reset_servos,
+    )
     cap = cv2.VideoCapture(0)
     cap.set(3, args.width)
     cap.set(4, args.height)

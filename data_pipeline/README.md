@@ -49,8 +49,8 @@ python3 data_pipeline/collect_data.py \
 
 Use `--dry_run` to record without moving hardware.
 
-Only remove `--dry_run` after `pigpio`, `pigpiod`, and the vendor `z_uart.py`
-are installed on the Raspberry Pi.
+Only remove `--dry_run` after `python3-serial` is installed and
+`car_runtime/hardware_check.py --open_uart` can open the UART port.
 
 ## Troubleshooting
 
@@ -61,14 +61,14 @@ AttributeError: 'NoneType' object has no attribute 'setup_uart'
 ```
 
 you tried real motor control without the vendor UART module. For data-pipeline
-testing, rerun the command with `--dry_run`. For real movement, put `z_uart.py`
-on the Pi next to `car_runtime/` or in `PYTHONPATH`, then install/start pigpio:
+testing, rerun the command with `--dry_run`. In the current runtime, this has
+been replaced by direct pyserial UART output, so update the repository and
+install serial support:
 
 ```bash
 sudo apt update
-sudo apt install -y pigpio python3-pigpio
-sudo systemctl enable pigpiod
-sudo systemctl start pigpiod
+sudo apt install -y python3-serial
+python3 car_runtime/hardware_check.py --open_uart
 ```
 
 ## Convert

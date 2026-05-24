@@ -8,17 +8,17 @@ API used by data collection and deployment scripts.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import List, Sequence
+
+try:
+    from uart_transport import UartTransport
+except ImportError:
+    from car_runtime.uart_transport import UartTransport
 
 try:
     import pigpio  # type: ignore
 except ImportError:  # pragma: no cover - only available on Raspberry Pi
     pigpio = None
-
-try:
-    import z_uart as myUart  # type: ignore
-except ImportError:  # pragma: no cover - only available on Raspberry Pi
-    myUart = None
 
 
 PIN_YUNTAI = 26
@@ -136,42 +136,36 @@ def command_from_key(key: str, speed: int = 300) -> TeleopCommand:
 class CarHardware:
     """Safe hardware wrapper with automatic dry-run fallback."""
 
-    def __init__(self, baud: int = 115200, reset_servos: bool = False, dry_run: bool | None = None):
-        self.dry_run = (pigpio is None or myUart is None) if dry_run is None else dry_run
+    def __init__(
+        self,
+        baud: int = 115200,
+        uart_port: str | None = None,
+        reset_servos: bool = False,
+        dry_run: bool | None = None,
+    ):
+        self.dry_run = False if dry_run is None else dry_run
+        self.uart = UartTransport(baud=baud, port=uart_port, dry_run=self.dry_run)
         self.pi = None
+        self._servo_warning_printed = False
         if self.dry_run:
-            print("[car_hardware] dry-run mode: pigpio/z_uart unavailable or disabled")
+            print("[car_hardware] dry-run mode: hardware output disabled")
         else:
-            missing = []
-            if pigpio is None:
-                missing.append("pigpio")
-            if myUart is None:
-                missing.append("z_uart.py")
-            elif not hasattr(myUart, "setup_uart") or not hasattr(myUart, "uart_send_str"):
-                missing.append("z_uart.py setup_uart/uart_send_str")
-            if missing:
+            if pigpio is not None:
+                self.pi = pigpio.pi()
+                if not getattr(self.pi, "connected", True):
+                    self.pi = None
+            if reset_servos and self.pi is None:
                 raise RuntimeError(
-                    "Real motor control requested, but hardware dependencies are missing: "
-                    + ", ".join(missing)
-                    + ". For data-pipeline testing, add --dry_run. For real movement, install "
-                    "pigpio and put the vendor z_uart.py next to car_runtime/ or in PYTHONPATH."
-                )
-            self.pi = pigpio.pi()
-            if not getattr(self.pi, "connected", True):
-                raise RuntimeError(
-                    "pigpio daemon is not reachable. Start it with: "
+                    "Servo reset requested, but pigpio is unavailable or pigpiod is not reachable. "
+                    "Install/start it with: sudo apt install -y pigpio python3-pigpio && "
                     "sudo systemctl enable pigpiod && sudo systemctl start pigpiod"
                 )
-            myUart.setup_uart(baud)
             if reset_servos:
                 self.set_pan_angle(90)
                 self.set_tilt_angle(90)
 
     def send_uart(self, command: str) -> None:
-        if self.dry_run:
-            print(f"  [dry-run] uart: {command}")
-            return
-        myUart.uart_send_str(command)
+        self.uart.send_str(command)
 
     def run_raw(self, l1: int, r1: int, l2: int, r2: int) -> None:
         self.send_uart(format_motor_command(l1, r1, l2, r2))
@@ -187,15 +181,26 @@ class CarHardware:
     def stop(self) -> None:
         self.send_uart(stop_command())
 
+    def _warn_no_servo(self) -> None:
+        if not self._servo_warning_printed:
+            print("[car_hardware] pigpio unavailable; skipping pan/tilt servo command")
+            self._servo_warning_printed = True
+
     def set_pan_pulse(self, pulse: int) -> None:
         if self.dry_run:
             print(f"  [dry-run] pan={clamp_pulse(pulse)}")
+            return
+        if self.pi is None:
+            self._warn_no_servo()
             return
         self.pi.set_servo_pulsewidth(PIN_YUNTAI, clamp_pulse(pulse))
 
     def set_tilt_pulse(self, pulse: int) -> None:
         if self.dry_run:
             print(f"  [dry-run] tilt={clamp_pulse(pulse)}")
+            return
+        if self.pi is None:
+            self._warn_no_servo()
             return
         self.pi.set_servo_pulsewidth(PIN_CAMERA, clamp_pulse(pulse))
 
@@ -211,6 +216,9 @@ class CarHardware:
         self.set_tilt_angle(115)
 
     def close(self) -> None:
-        self.stop()
-        if self.pi is not None:
-            self.pi.stop()
+        try:
+            self.stop()
+        finally:
+            self.uart.close()
+            if self.pi is not None:
+                self.pi.stop()

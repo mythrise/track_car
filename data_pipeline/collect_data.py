@@ -47,11 +47,16 @@ def main():
     ap.add_argument("--teleop", choices=["none", "keyboard"], default="none")
     ap.add_argument("--speed", type=int, default=300)
     ap.add_argument("--dry_run", action="store_true")
+    ap.add_argument("--uart_port", default=None, help="UART device, for example /dev/ttyAMA0 or /dev/serial0.")
     args = ap.parse_args()
 
     save_dir = os.path.join(args.out_root, args.episode_name)
     os.makedirs(save_dir, exist_ok=True)
-    hardware = CarHardware(reset_servos=True, dry_run=args.dry_run) if args.teleop == "keyboard" else None
+    hardware = (
+        CarHardware(reset_servos=False, dry_run=args.dry_run, uart_port=args.uart_port)
+        if args.teleop == "keyboard"
+        else None
+    )
 
     cap = cv2.VideoCapture(0)
     cap.set(3, args.width)
