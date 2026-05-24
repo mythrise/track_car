@@ -36,3 +36,25 @@ python3 car_runtime/move_test.py --move forward --speed 200 --duration 0.3 --exe
 ```
 
 Keep the car lifted or in a clear low-speed area before using `--execute`.
+
+## Hardware Dependencies For Real Movement
+
+Dry-run mode works without motor hardware dependencies. Real movement requires:
+
+```text
+pigpio
+running pigpiod daemon
+vendor z_uart.py
+```
+
+Install/start pigpio on Raspberry Pi:
+
+```bash
+sudo apt update
+sudo apt install -y pigpio python3-pigpio
+sudo systemctl enable pigpiod
+sudo systemctl start pigpiod
+```
+
+Put the vendor `z_uart.py` file next to `car_runtime/` or anywhere in
+`PYTHONPATH`. Without it, use `--dry_run`.

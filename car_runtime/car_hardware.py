@@ -142,7 +142,26 @@ class CarHardware:
         if self.dry_run:
             print("[car_hardware] dry-run mode: pigpio/z_uart unavailable or disabled")
         else:
+            missing = []
+            if pigpio is None:
+                missing.append("pigpio")
+            if myUart is None:
+                missing.append("z_uart.py")
+            elif not hasattr(myUart, "setup_uart") or not hasattr(myUart, "uart_send_str"):
+                missing.append("z_uart.py setup_uart/uart_send_str")
+            if missing:
+                raise RuntimeError(
+                    "Real motor control requested, but hardware dependencies are missing: "
+                    + ", ".join(missing)
+                    + ". For data-pipeline testing, add --dry_run. For real movement, install "
+                    "pigpio and put the vendor z_uart.py next to car_runtime/ or in PYTHONPATH."
+                )
             self.pi = pigpio.pi()
+            if not getattr(self.pi, "connected", True):
+                raise RuntimeError(
+                    "pigpio daemon is not reachable. Start it with: "
+                    "sudo systemctl enable pigpiod && sudo systemctl start pigpiod"
+                )
             myUart.setup_uart(baud)
             if reset_servos:
                 self.set_pan_angle(90)

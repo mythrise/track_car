@@ -42,11 +42,34 @@ python3 data_pipeline/collect_data.py \
   --episode_name ep001 \
   --instruction "follow the person in red shirt" \
   --teleop keyboard \
+  --dry_run \
   --speed 200 \
   --fps 10
 ```
 
 Use `--dry_run` to record without moving hardware.
+
+Only remove `--dry_run` after `pigpio`, `pigpiod`, and the vendor `z_uart.py`
+are installed on the Raspberry Pi.
+
+## Troubleshooting
+
+If you see an error like:
+
+```text
+AttributeError: 'NoneType' object has no attribute 'setup_uart'
+```
+
+you tried real motor control without the vendor UART module. For data-pipeline
+testing, rerun the command with `--dry_run`. For real movement, put `z_uart.py`
+on the Pi next to `car_runtime/` or in `PYTHONPATH`, then install/start pigpio:
+
+```bash
+sudo apt update
+sudo apt install -y pigpio python3-pigpio
+sudo systemctl enable pigpiod
+sudo systemctl start pigpiod
+```
 
 ## Convert
 
