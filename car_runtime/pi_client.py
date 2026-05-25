@@ -14,9 +14,11 @@ import time
 try:
     from car_hardware import CarHardware
     from car_protocol import recv_json, send_jpeg_frame, send_json
+    from process_cleanup import cleanup_named_processes
 except ImportError:
     from car_runtime.car_hardware import CarHardware
     from car_runtime.car_protocol import recv_json, send_jpeg_frame, send_json
+    from car_runtime.process_cleanup import cleanup_named_processes
 
 
 def setup_hardware(dry_run=False, uart_port=None, reset_servos=False):
@@ -56,6 +58,10 @@ def main():
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--uart_port", default=None, help="UART device, for example /dev/ttyAMA0 or /dev/serial0.")
     ap.add_argument("--reset_servos", action="store_true", help="Reset pan/tilt servos on startup.")
+    ap.add_argument("--no_cleanup_processes", action="store_true",
+                    help="Do not kill vendor camera/main processes before opening hardware.")
+    ap.add_argument("--cleanup_dry_run", action="store_true",
+                    help="Print cleanup targets without killing them.")
     args = ap.parse_args()
 
     hello = {
@@ -81,6 +87,11 @@ def main():
     hardware = None
     cap = None
     try:
+        if not args.no_cleanup_processes:
+            cleanup_named_processes(["mjpg", "z_main"], dry_run=args.cleanup_dry_run)
+            if args.cleanup_dry_run:
+                return
+
         hardware = setup_hardware(
             dry_run=args.dry_run,
             uart_port=args.uart_port,

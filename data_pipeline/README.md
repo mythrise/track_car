@@ -49,6 +49,16 @@ python3 data_pipeline/collect_data.py \
 
 Use `--dry_run` to record without moving hardware.
 
+`collect_data.py` cleans stale vendor `mjpg` and `z_main` processes before
+opening the camera. Preview cleanup targets:
+
+```bash
+python3 data_pipeline/collect_data.py \
+  --episode_name cleanup_preview \
+  --teleop none \
+  --cleanup_dry_run
+```
+
 Only remove `--dry_run` after `python3-serial` is installed and
 `car_runtime/hardware_check.py --open_uart` can open the UART port.
 

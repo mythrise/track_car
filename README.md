@@ -181,6 +181,10 @@ python inference_pipeline/mac_server.py \
   --mock_action stop
 ```
 
+The server clears stale listeners on its TCP port before startup. Use
+`--cleanup_dry_run` to preview what would be killed, or `--no_cleanup_port` to
+disable this behavior.
+
 Full model mode:
 
 ```bash

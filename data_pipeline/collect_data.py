@@ -22,8 +22,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
     from car_hardware import CarHardware, command_from_key
+    from process_cleanup import cleanup_named_processes
 except ImportError:
     from car_runtime.car_hardware import CarHardware, command_from_key
+    from car_runtime.process_cleanup import cleanup_named_processes
 
 
 def read_key_nonblocking():
@@ -48,7 +50,16 @@ def main():
     ap.add_argument("--speed", type=int, default=300)
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--uart_port", default=None, help="UART device, for example /dev/ttyAMA0 or /dev/serial0.")
+    ap.add_argument("--no_cleanup_processes", action="store_true",
+                    help="Do not kill vendor camera/main processes before collection.")
+    ap.add_argument("--cleanup_dry_run", action="store_true",
+                    help="Print cleanup targets without killing them.")
     args = ap.parse_args()
+
+    if not args.no_cleanup_processes:
+        cleanup_named_processes(["mjpg", "z_main"], dry_run=args.cleanup_dry_run)
+        if args.cleanup_dry_run:
+            return
 
     save_dir = os.path.join(args.out_root, args.episode_name)
     os.makedirs(save_dir, exist_ok=True)

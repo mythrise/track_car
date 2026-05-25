@@ -11,6 +11,7 @@ testing.
 | `car_hardware.py` | Wraps vendor UART motor commands and pigpio pan/tilt PWM. |
 | `uart_transport.py` | Opens the Raspberry Pi UART and sends vendor motor strings with pyserial. |
 | `hardware_check.py` | Checks UART and pigpio availability before real movement. |
+| `process_cleanup.py` | Kills stale vendor camera/main processes and stale TCP port listeners. |
 | `car_protocol.py` | Shared length-prefixed TCP protocol. |
 | `move_test.py` | Bounded single-action smoke test. |
 
@@ -22,6 +23,36 @@ python3 car_runtime/pi_client.py \
   --server_port 9999 \
   --dry_run
 ```
+
+`pi_client.py` cleans stale vendor processes before opening camera/hardware:
+
+```text
+mjpg
+z_main
+```
+
+Preview cleanup targets without killing anything:
+
+```bash
+python3 car_runtime/pi_client.py \
+  --server_ip <Mac_IP> \
+  --server_port 9999 \
+  --dry_run \
+  --cleanup_dry_run
+```
+
+Disable this cleanup if needed:
+
+```bash
+python3 car_runtime/pi_client.py \
+  --server_ip <Mac_IP> \
+  --server_port 9999 \
+  --dry_run \
+  --no_cleanup_processes
+```
+
+If cleanup says permission denied, stop the process manually with `sudo`, or
+run the client with sufficient permissions for that test.
 
 ## Direct Motor Test
 

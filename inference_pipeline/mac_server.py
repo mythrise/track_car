@@ -20,9 +20,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 try:
     from car_hardware import command_from_key, waypoint_to_motor
     from car_protocol import recv_jpeg_frame, recv_json, send_json
+    from process_cleanup import cleanup_port
 except ImportError:
     from car_runtime.car_hardware import command_from_key, waypoint_to_motor
     from car_runtime.car_protocol import recv_jpeg_frame, recv_json, send_json
+    from car_runtime.process_cleanup import cleanup_port
 
 
 def resolve_opentrackvla_root(root_arg):
@@ -124,7 +126,16 @@ def main():
     ap.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
     ap.add_argument("--mock_speed", type=int, default=200)
     ap.add_argument("--timeout", type=float, default=2.0)
+    ap.add_argument("--no_cleanup_port", action="store_true",
+                    help="Do not kill an existing process listening on --port before startup.")
+    ap.add_argument("--cleanup_dry_run", action="store_true",
+                    help="Print cleanup targets without killing them.")
     args = ap.parse_args()
+
+    if not args.no_cleanup_port:
+        cleanup_port(args.port, dry_run=args.cleanup_dry_run)
+        if args.cleanup_dry_run:
+            return
 
     if args.mock_control:
         device = None

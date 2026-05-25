@@ -22,6 +22,25 @@ python inference_pipeline/mac_server.py \
   --mock_action stop
 ```
 
+Before binding, the server now clears stale processes already listening on
+`--port`. Preview cleanup without killing anything:
+
+```bash
+python inference_pipeline/mac_server.py \
+  --port 9999 \
+  --mock_control \
+  --cleanup_dry_run
+```
+
+Disable port cleanup:
+
+```bash
+python inference_pipeline/mac_server.py \
+  --port 9999 \
+  --mock_control \
+  --no_cleanup_port
+```
+
 ## Full Model Server
 
 ```bash
