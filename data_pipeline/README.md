@@ -28,7 +28,7 @@ Each `meta_*.json` contains:
   "episode": "ep001",
   "teleop": "keyboard",
   "command": "forward",
-  "motors": [1700, 1300, 1700, 1300],
+  "motors": [1300, 1700, 1300, 1700],
   "action": [1.0, 0.0, 0.0]
 }
 ```
@@ -42,9 +42,10 @@ python3 data_pipeline/collect_data.py \
   --episode_name ep001 \
   --instruction "follow the person in red shirt" \
   --teleop keyboard \
-  --dry_run \
-  --speed 200 \
-  --fps 10
+  --speed 400 \
+  --fps 5 \
+  --camera_backend v4l2 \
+  --camera_fourcc MJPG
 ```
 
 Use `--dry_run` to record without moving hardware.
@@ -79,12 +80,17 @@ Then use the working backend in collection:
 
 ```bash
 python3 data_pipeline/collect_data.py \
-  --episode_name ep001 \
+  --episode_name smoke_real_001 \
+  --instruction "follow the person in red shirt" \
   --teleop keyboard \
-  --speed 160 \
+  --speed 400 \
+  --fps 5 \
   --camera_backend v4l2 \
-  --camera_fourcc MJPG
+  --camera_fourcc MJPG \
+  --max_frames 50
 ```
+
+Remove `--max_frames` for a normal long collection run.
 
 If low-speed `w/a/s/d` commands do not overcome static friction, add a short
 startup kick:
@@ -94,11 +100,13 @@ python3 data_pipeline/collect_data.py \
   --episode_name ep001 \
   --instruction "follow the person in red shirt" \
   --teleop keyboard \
-  --speed 160 \
-  --kick_speed 350 \
+  --speed 400 \
+  --kick_speed 650 \
   --kick_duration 0.06 \
   --kick_repeat 0.75 \
-  --fps 10
+  --fps 5 \
+  --camera_backend v4l2 \
+  --camera_fourcc MJPG
 ```
 
 This sends the stronger command for only `0.06` seconds, then returns to the

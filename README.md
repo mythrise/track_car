@@ -153,8 +153,10 @@ python3 data_pipeline/collect_data.py \
   --episode_name ep001 \
   --instruction "follow the person in red shirt" \
   --teleop keyboard \
-  --speed 200 \
-  --fps 10
+  --speed 400 \
+  --fps 5 \
+  --camera_backend v4l2 \
+  --camera_fourcc MJPG
 ```
 
 Convert on Mac:
