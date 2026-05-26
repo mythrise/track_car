@@ -12,8 +12,10 @@ import time
 
 try:
     from car_hardware import CarHardware, boosted_motors, command_from_key
+    from process_cleanup import cleanup_named_processes
 except ImportError:
     from car_runtime.car_hardware import CarHardware, boosted_motors, command_from_key
+    from car_runtime.process_cleanup import cleanup_named_processes
 
 
 KEY_BY_MOVE = {
@@ -44,7 +46,16 @@ def main():
                     help="Optional short startup kick pulse delta. Use 0 to disable.")
     ap.add_argument("--kick_duration", type=float, default=0.06,
                     help="Kick duration in seconds, clamped to 0.25.")
+    ap.add_argument("--no_cleanup_processes", action="store_true",
+                    help="Do not kill vendor camera/main processes before motor test.")
+    ap.add_argument("--cleanup_dry_run", action="store_true",
+                    help="Print cleanup targets without killing them.")
     args = ap.parse_args()
+
+    if not args.no_cleanup_processes:
+        cleanup_named_processes(["mjpg", "z_main"], dry_run=args.cleanup_dry_run)
+        if args.cleanup_dry_run:
+            return
 
     duration = max(0.05, min(args.duration, 3.0))
     speed = max(0, min(args.speed, 600))

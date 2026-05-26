@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -71,11 +70,6 @@ def pids_by_name(pattern: str) -> list[int]:
     if sys.platform == "win32":
         return []
 
-    if shutil.which("pgrep"):
-        result = _run(["pgrep", "-f", pattern])
-        if result.returncode in (0, 1):
-            return [int(x) for x in result.stdout.split() if x.isdigit()]
-
     result = _run(["ps", "-eo", "pid=,command="])
     pids: list[int] = []
     for line in result.stdout.splitlines():
@@ -83,7 +77,11 @@ def pids_by_name(pattern: str) -> list[int]:
         if not line:
             continue
         pid_text, _, command = line.partition(" ")
-        if pid_text.isdigit() and re.search(pattern, command):
+        if not pid_text.isdigit():
+            continue
+        if "process_cleanup.py" in command or " pgrep " in command or " grep " in command:
+            continue
+        if re.search(pattern, command):
             pids.append(int(pid_text))
     return pids
 
@@ -112,12 +110,12 @@ def pids_on_port(port: int) -> list[int]:
                     pids.append(int(pid_text))
         return pids
 
-    if shutil.which("lsof"):
+    if _has_command("lsof"):
         result = _run(["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"])
         if result.returncode in (0, 1):
             return [int(x) for x in result.stdout.split() if x.isdigit()]
 
-    if shutil.which("ss"):
+    if _has_command("ss"):
         result = _run(["ss", "-ltnp", f"sport = :{port}"])
         pids = []
         for match in re.finditer(r"pid=(\d+)", result.stdout):
@@ -126,6 +124,10 @@ def pids_on_port(port: int) -> list[int]:
 
     print("[cleanup] cannot inspect ports: install lsof or iproute2/ss")
     return []
+
+
+def _has_command(name: str) -> bool:
+    return _run(["/bin/sh", "-lc", f"command -v {name}"]).returncode == 0
 
 
 def cleanup_port(port: int, dry_run: bool = False) -> int:

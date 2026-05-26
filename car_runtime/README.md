@@ -11,11 +11,23 @@ testing.
 | `car_hardware.py` | Wraps vendor UART motor commands and pigpio pan/tilt PWM. |
 | `uart_transport.py` | Opens the Raspberry Pi UART and sends vendor motor strings with pyserial. |
 | `hardware_check.py` | Checks UART and pigpio availability before real movement. |
+| `kill_port.py` | Standalone command to clear a TCP port before startup. |
 | `process_cleanup.py` | Kills stale vendor camera/main processes and stale TCP port listeners. |
 | `car_protocol.py` | Shared length-prefixed TCP protocol. |
 | `move_test.py` | Bounded single-action smoke test. |
+| `speed_sweep.py` | Free speed threshold testing for real motor tuning. |
 
 ## Protocol Smoke Test
+
+Clear a stale server port before startup:
+
+```bash
+python3 car_runtime/kill_port.py --port 9999 --dry_run
+python3 car_runtime/kill_port.py --port 9999
+```
+
+`inference_pipeline/mac_server.py` already runs the same port cleanup by
+default before it binds `--port`.
 
 ```bash
 python3 car_runtime/pi_client.py \
@@ -154,3 +166,39 @@ python3 car_runtime/pi_client.py \
   --kick_speed 350 \
   --kick_duration 0.06
 ```
+
+## Speed Sweep
+
+Use this when the motor spins but the car still cannot move under load. Start
+with the car lifted, then repeat on the floor with very short durations.
+
+Dry-run a custom speed list:
+
+```bash
+python3 car_runtime/speed_sweep.py \
+  --move forward \
+  --speeds 120,160,220,300,380,460 \
+  --kick_speed 400
+```
+
+Real sweep:
+
+```bash
+python3 car_runtime/speed_sweep.py \
+  --move forward \
+  --speeds 160,220,300,380,460,540 \
+  --duration 0.25 \
+  --pause 0.8 \
+  --kick_speed 420 \
+  --kick_duration 0.06 \
+  --execute \
+  --confirm_each
+```
+
+If the car only starts moving at very high values, check battery voltage,
+wheel friction, load, and whether the motor direction mapping is fighting
+itself.
+
+Both `move_test.py` and `speed_sweep.py` clear stale `mjpg`/`z_main` vendor
+processes before testing. Preview with `--cleanup_dry_run`, or disable with
+`--no_cleanup_processes`.

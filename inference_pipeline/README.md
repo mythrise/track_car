@@ -32,6 +32,13 @@ python inference_pipeline/mac_server.py \
   --cleanup_dry_run
 ```
 
+Standalone cleanup command:
+
+```bash
+python car_runtime/kill_port.py --port 9999 --dry_run
+python car_runtime/kill_port.py --port 9999
+```
+
 Disable port cleanup:
 
 ```bash
