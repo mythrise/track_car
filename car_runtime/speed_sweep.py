@@ -7,10 +7,10 @@ import argparse
 import time
 
 try:
-    from car_hardware import CarHardware, boosted_motors, command_from_key
+    from car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
     from process_cleanup import cleanup_named_processes
 except ImportError:
-    from car_runtime.car_hardware import CarHardware, boosted_motors, command_from_key
+    from car_runtime.car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
     from car_runtime.process_cleanup import cleanup_named_processes
 
 
@@ -31,7 +31,7 @@ def parse_speeds(text: str | None, start: int, stop: int, step: int) -> list[int
         if step <= 0:
             raise ValueError("--step must be positive")
         speeds = list(range(start, stop + 1, step))
-    return [max(0, min(speed, 900)) for speed in speeds]
+    return [max(0, min(speed, MAX_SPEED)) for speed in speeds]
 
 
 def confirm(prompt: str) -> bool:
@@ -67,7 +67,7 @@ def main() -> None:
     speeds = parse_speeds(args.speeds, args.start, args.stop, args.step)
     duration = max(0.05, min(args.duration, 2.0))
     pause = max(0.0, min(args.pause, 5.0))
-    kick_speed = max(0, min(args.kick_speed, 900))
+    kick_speed = max(0, min(args.kick_speed, MAX_SPEED))
     kick_duration = max(0.0, min(args.kick_duration, 0.25))
 
     print(f"[speed_sweep] move={args.move} speeds={speeds} duration={duration:.2f}s "

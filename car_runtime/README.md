@@ -69,6 +69,24 @@ run the client with sufficient permissions for that test.
 
 ## Direct Motor Test
 
+Motor control now follows the verified `MotionControl.py` wiring:
+
+```text
+left wheels:  PWM = 1500 - speed
+right wheels: PWM = 1500 + speed
+```
+
+For `--speed 400`, `move_test.py` sends:
+
+```text
+forward:      [1100, 1900, 1100, 1900]
+backward:     [1900, 1100, 1900, 1100]
+left turn:    [1900, 1900, 1900, 1900]
+right turn:   [1100, 1100, 1100, 1100]
+strafe_left:  [1900, 1900, 1100, 1100]
+strafe_right: [1100, 1100, 1900, 1900]
+```
+
 Check camera startup time:
 
 ```bash
@@ -167,7 +185,7 @@ remote example directly through `uart_transport.py`; a separate vendor
 
 ## Startup Kick
 
-Some motors do not move at low steady pulse deltas because static friction is
+Some motors do not move at low steady wheel speeds because static friction is
 higher than rolling friction. Use a short kick instead of raising the whole
 run speed:
 

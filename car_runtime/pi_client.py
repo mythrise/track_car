@@ -13,12 +13,12 @@ import time
 
 try:
     from camera_source import BACKENDS, open_camera
-    from car_hardware import CarHardware, NEUTRAL, boosted_motors, motor_delta
+    from car_hardware import MAX_SPEED, CarHardware, NEUTRAL, boosted_motors, motor_delta
     from car_protocol import recv_json, send_jpeg_frame, send_json
     from process_cleanup import cleanup_named_processes
 except ImportError:
     from car_runtime.camera_source import BACKENDS, open_camera
-    from car_runtime.car_hardware import CarHardware, NEUTRAL, boosted_motors, motor_delta
+    from car_runtime.car_hardware import MAX_SPEED, CarHardware, NEUTRAL, boosted_motors, motor_delta
     from car_runtime.car_protocol import recv_json, send_jpeg_frame, send_json
     from car_runtime.process_cleanup import cleanup_named_processes
 
@@ -153,7 +153,7 @@ def main():
             motors = cmd.get("motors", [1500, 1500, 1500, 1500])
             now = time.time()
             direction = motor_direction(motors)
-            kick_speed = max(0, min(args.kick_speed, 900))
+            kick_speed = max(0, min(args.kick_speed, MAX_SPEED))
             kick_duration = max(0.0, min(args.kick_duration, 0.25))
             direction_changed = direction != last_direction
             repeat_due = args.kick_repeat > 0 and (now - last_kick_time) >= args.kick_repeat

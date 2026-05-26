@@ -21,11 +21,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
-    from car_hardware import CarHardware, boosted_motors, command_from_key
+    from car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
     from camera_source import BACKENDS, open_camera
     from process_cleanup import cleanup_named_processes
 except ImportError:
-    from car_runtime.car_hardware import CarHardware, boosted_motors, command_from_key
+    from car_runtime.car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
     from car_runtime.camera_source import BACKENDS, open_camera
     from car_runtime.process_cleanup import cleanup_named_processes
 
@@ -119,7 +119,7 @@ def main():
                 if key is not None:
                     now = time.time()
                     next_cmd = command_from_key(key, args.speed)
-                    kick_speed = max(0, min(args.kick_speed, 900))
+                    kick_speed = max(0, min(args.kick_speed, MAX_SPEED))
                     kick_duration = max(0.0, min(args.kick_duration, 0.25))
                     command_changed = next_cmd.name != last_cmd.name
                     repeat_due = args.kick_repeat > 0 and (now - last_kick_time) >= args.kick_repeat

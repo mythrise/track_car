@@ -49,6 +49,9 @@ python3 data_pipeline/collect_data.py \
 
 Use `--dry_run` to record without moving hardware.
 
+Keyboard teleop uses the verified `MotionControl.py` motor mapping: left wheel
+PWM is `1500 - speed`, right wheel PWM is `1500 + speed`.
+
 If startup pauses after UART opens, it is usually waiting for the camera. Test
 camera latency directly:
 
