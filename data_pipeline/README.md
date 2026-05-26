@@ -49,6 +49,24 @@ python3 data_pipeline/collect_data.py \
 
 Use `--dry_run` to record without moving hardware.
 
+If startup pauses after UART opens, it is usually waiting for the camera. Test
+camera latency directly:
+
+```bash
+python3 car_runtime/camera_check.py
+python3 car_runtime/camera_check.py --camera_backend v4l2
+```
+
+Then use the faster backend in collection:
+
+```bash
+python3 data_pipeline/collect_data.py \
+  --episode_name ep001 \
+  --teleop keyboard \
+  --speed 160 \
+  --camera_backend v4l2
+```
+
 If low-speed `w/a/s/d` commands do not overcome static friction, add a short
 startup kick:
 

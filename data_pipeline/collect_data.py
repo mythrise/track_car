@@ -38,12 +38,38 @@ def read_key_nonblocking():
     return " " if ch == " " else ch.lower()
 
 
+def cv_backend(name: str):
+    if name == "v4l2" and hasattr(cv2, "CAP_V4L2"):
+        return cv2.CAP_V4L2
+    return 0
+
+
+def open_camera(index: int, backend: str, width: int, height: int, warmup: float):
+    print(f"[camera] opening index={index} backend={backend} size={width}x{height}", flush=True)
+    cap = cv2.VideoCapture(index, cv_backend(backend)) if backend != "auto" else cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError(
+            f"Could not open camera index {index}. Check camera cable, mjpg/z_main processes, and camera permissions."
+        )
+    cap.set(3, width)
+    cap.set(4, height)
+    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    if warmup > 0:
+        time.sleep(warmup)
+    print("[camera] opened", flush=True)
+    return cap
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--episode_name", required=True)
     ap.add_argument("--instruction", default="follow the person")
     ap.add_argument("--width", type=int, default=320)
     ap.add_argument("--height", type=int, default=240)
+    ap.add_argument("--camera_index", type=int, default=0)
+    ap.add_argument("--camera_backend", choices=["auto", "v4l2"], default="auto")
+    ap.add_argument("--camera_warmup", type=float, default=1.0)
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--out_root", default="data/collected")
     ap.add_argument("--teleop", choices=["none", "keyboard"], default="none")
@@ -63,22 +89,27 @@ def main():
     args = ap.parse_args()
 
     if not args.no_cleanup_processes:
+        print("[startup] cleaning stale vendor processes", flush=True)
         cleanup_named_processes(["mjpg", "z_main"], dry_run=args.cleanup_dry_run)
         if args.cleanup_dry_run:
             return
 
     save_dir = os.path.join(args.out_root, args.episode_name)
     os.makedirs(save_dir, exist_ok=True)
-    hardware = (
-        CarHardware(reset_servos=False, dry_run=args.dry_run, uart_port=args.uart_port)
-        if args.teleop == "keyboard"
-        else None
+
+    cap = open_camera(
+        args.camera_index,
+        args.camera_backend,
+        args.width,
+        args.height,
+        max(0.0, min(args.camera_warmup, 5.0)),
     )
 
-    cap = cv2.VideoCapture(0)
-    cap.set(3, args.width)
-    cap.set(4, args.height)
-    time.sleep(1.0)
+    hardware = None
+    if args.teleop == "keyboard":
+        print("[startup] opening car hardware", flush=True)
+        hardware = CarHardware(reset_servos=False, dry_run=args.dry_run, uart_port=args.uart_port)
+        print("[startup] car hardware ready", flush=True)
 
     frame_idx = 0
     interval = 1.0 / args.fps

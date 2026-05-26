@@ -10,6 +10,7 @@ testing.
 | `pi_client.py` | Captures camera frames, sends them to the Mac server, receives command JSON, executes motors and pan/tilt. |
 | `car_hardware.py` | Wraps vendor UART motor commands and pigpio pan/tilt PWM. |
 | `uart_transport.py` | Opens the Raspberry Pi UART and sends vendor motor strings with pyserial. |
+| `camera_check.py` | Measures camera open/read latency. |
 | `hardware_check.py` | Checks UART and pigpio availability before real movement. |
 | `kill_port.py` | Standalone command to clear a TCP port before startup. |
 | `process_cleanup.py` | Kills stale vendor camera/main processes and stale TCP port listeners. |
@@ -67,6 +68,13 @@ If cleanup says permission denied, stop the process manually with `sudo`, or
 run the client with sufficient permissions for that test.
 
 ## Direct Motor Test
+
+Check camera startup time:
+
+```bash
+python3 car_runtime/camera_check.py
+python3 car_runtime/camera_check.py --camera_backend v4l2
+```
 
 Check runtime dependencies:
 
