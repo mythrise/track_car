@@ -54,17 +54,25 @@ camera latency directly:
 
 ```bash
 python3 car_runtime/camera_check.py
+python3 car_runtime/camera_check.py --camera_backend picamera2
 python3 car_runtime/camera_check.py --camera_backend v4l2
 ```
 
-Then use the faster backend in collection:
+For Raspberry Pi CSI cameras, prefer `picamera2`. Install it if needed:
+
+```bash
+sudo apt update
+sudo apt install -y python3-picamera2
+```
+
+Then use the working backend in collection:
 
 ```bash
 python3 data_pipeline/collect_data.py \
   --episode_name ep001 \
   --teleop keyboard \
   --speed 160 \
-  --camera_backend v4l2
+  --camera_backend picamera2
 ```
 
 If low-speed `w/a/s/d` commands do not overcome static friction, add a short

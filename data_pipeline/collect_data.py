@@ -22,9 +22,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
     from car_hardware import CarHardware, boosted_motors, command_from_key
+    from camera_source import BACKENDS, open_camera
     from process_cleanup import cleanup_named_processes
 except ImportError:
     from car_runtime.car_hardware import CarHardware, boosted_motors, command_from_key
+    from car_runtime.camera_source import BACKENDS, open_camera
     from car_runtime.process_cleanup import cleanup_named_processes
 
 
@@ -38,29 +40,6 @@ def read_key_nonblocking():
     return " " if ch == " " else ch.lower()
 
 
-def cv_backend(name: str):
-    if name == "v4l2" and hasattr(cv2, "CAP_V4L2"):
-        return cv2.CAP_V4L2
-    return 0
-
-
-def open_camera(index: int, backend: str, width: int, height: int, warmup: float):
-    print(f"[camera] opening index={index} backend={backend} size={width}x{height}", flush=True)
-    cap = cv2.VideoCapture(index, cv_backend(backend)) if backend != "auto" else cv2.VideoCapture(index)
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Could not open camera index {index}. Check camera cable, mjpg/z_main processes, and camera permissions."
-        )
-    cap.set(3, width)
-    cap.set(4, height)
-    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    if warmup > 0:
-        time.sleep(warmup)
-    print("[camera] opened", flush=True)
-    return cap
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--episode_name", required=True)
@@ -68,7 +47,7 @@ def main():
     ap.add_argument("--width", type=int, default=320)
     ap.add_argument("--height", type=int, default=240)
     ap.add_argument("--camera_index", type=int, default=0)
-    ap.add_argument("--camera_backend", choices=["auto", "v4l2"], default="auto")
+    ap.add_argument("--camera_backend", choices=BACKENDS, default="auto")
     ap.add_argument("--camera_warmup", type=float, default=1.0)
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--out_root", default="data/collected")

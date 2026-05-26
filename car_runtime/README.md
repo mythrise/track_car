@@ -73,7 +73,16 @@ Check camera startup time:
 
 ```bash
 python3 car_runtime/camera_check.py
+python3 car_runtime/camera_check.py --camera_backend picamera2
 python3 car_runtime/camera_check.py --camera_backend v4l2
+```
+
+For Raspberry Pi CSI cameras, `picamera2` is usually the correct backend. If it
+is missing:
+
+```bash
+sudo apt update
+sudo apt install -y python3-picamera2
 ```
 
 Check runtime dependencies:
