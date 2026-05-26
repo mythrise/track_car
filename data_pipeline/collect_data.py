@@ -21,10 +21,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
-    from car_hardware import CarHardware, command_from_key
+    from car_hardware import CarHardware, boosted_motors, command_from_key
     from process_cleanup import cleanup_named_processes
 except ImportError:
-    from car_runtime.car_hardware import CarHardware, command_from_key
+    from car_runtime.car_hardware import CarHardware, boosted_motors, command_from_key
     from car_runtime.process_cleanup import cleanup_named_processes
 
 
@@ -48,6 +48,12 @@ def main():
     ap.add_argument("--out_root", default="data/collected")
     ap.add_argument("--teleop", choices=["none", "keyboard"], default="none")
     ap.add_argument("--speed", type=int, default=300)
+    ap.add_argument("--kick_speed", type=int, default=0,
+                    help="Optional short startup kick pulse delta for keyboard teleop. Use 0 to disable.")
+    ap.add_argument("--kick_duration", type=float, default=0.06,
+                    help="Kick duration in seconds, clamped to 0.25.")
+    ap.add_argument("--kick_repeat", type=float, default=0.75,
+                    help="Minimum seconds between repeated kicks while holding the same key.")
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--uart_port", default=None, help="UART device, for example /dev/ttyAMA0 or /dev/serial0.")
     ap.add_argument("--no_cleanup_processes", action="store_true",
@@ -86,18 +92,39 @@ def main():
 
     try:
         last_cmd = command_from_key(" ", args.speed)
+        last_kick_time = 0.0
         while True:
             t0 = time.time()
             ret, frame = cap.read()
             if not ret:
                 continue
             frame = cv2.flip(frame, -1)
+            frame_kick_applied = False
+            frame_kick_motors = None
 
             if args.teleop == "keyboard":
                 key = read_key_nonblocking()
                 if key is not None:
-                    last_cmd = command_from_key(key, args.speed)
-                    hardware.run_motors(last_cmd.motors)
+                    now = time.time()
+                    next_cmd = command_from_key(key, args.speed)
+                    kick_speed = max(0, min(args.kick_speed, 900))
+                    kick_duration = max(0.0, min(args.kick_duration, 0.25))
+                    command_changed = next_cmd.name != last_cmd.name
+                    repeat_due = args.kick_repeat > 0 and (now - last_kick_time) >= args.kick_repeat
+                    should_kick = (
+                        kick_speed > 0
+                        and next_cmd.name != "stop"
+                        and kick_duration > 0
+                        and (command_changed or repeat_due)
+                    )
+                    if should_kick:
+                        frame_kick_motors = boosted_motors(next_cmd.motors, kick_speed)
+                        hardware.run_motors_with_kick(next_cmd.motors, frame_kick_motors, kick_duration)
+                        last_kick_time = now
+                        frame_kick_applied = True
+                    else:
+                        hardware.run_motors(next_cmd.motors)
+                    last_cmd = next_cmd
 
             fname = f"frame_{frame_idx:06d}.jpg"
             cv2.imwrite(os.path.join(save_dir, fname), frame)
@@ -112,6 +139,8 @@ def main():
                 "command": last_cmd.name,
                 "motors": last_cmd.motors,
                 "action": last_cmd.action,
+                "kick_applied": frame_kick_applied,
+                "kick_motors": frame_kick_motors,
             }
             with open(os.path.join(save_dir, f"meta_{frame_idx:06d}.json"), "w") as f:
                 json.dump(meta, f)
@@ -141,6 +170,10 @@ def main():
             "height": args.height,
             "fps": args.fps,
             "teleop": args.teleop,
+            "speed": args.speed,
+            "kick_speed": args.kick_speed,
+            "kick_duration": args.kick_duration,
+            "kick_repeat": args.kick_repeat,
         }
         with open(os.path.join(save_dir, "episode.json"), "w") as f:
             json.dump(summary, f, indent=2)

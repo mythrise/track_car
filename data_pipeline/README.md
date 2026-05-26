@@ -49,6 +49,24 @@ python3 data_pipeline/collect_data.py \
 
 Use `--dry_run` to record without moving hardware.
 
+If low-speed `w/a/s/d` commands do not overcome static friction, add a short
+startup kick:
+
+```bash
+python3 data_pipeline/collect_data.py \
+  --episode_name ep001 \
+  --instruction "follow the person in red shirt" \
+  --teleop keyboard \
+  --speed 160 \
+  --kick_speed 350 \
+  --kick_duration 0.06 \
+  --kick_repeat 0.75 \
+  --fps 10
+```
+
+This sends the stronger command for only `0.06` seconds, then returns to the
+steady `--speed`. Start with the car lifted.
+
 `collect_data.py` cleans stale vendor `mjpg` and `z_main` processes before
 opening the camera. Preview cleanup targets:
 

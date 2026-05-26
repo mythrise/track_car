@@ -8,6 +8,7 @@ API used by data collection and deployment scripts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import time
 from typing import List, Sequence
 
 try:
@@ -91,6 +92,20 @@ def motor_to_action(motors: Sequence[int], base: int = NEUTRAL, scale: float = 3
     return [vx / scale, vy / scale, wz / scale]
 
 
+def motor_delta(motors: Sequence[int], base: int = NEUTRAL) -> int:
+    return max(abs(int(v) - base) for v in motors)
+
+
+def boosted_motors(motors: Sequence[int], kick_speed: int, base: int = NEUTRAL) -> List[int]:
+    """Scale a motor command outward from neutral for a short startup kick."""
+    current_delta = motor_delta(motors, base=base)
+    if current_delta <= 0 or kick_speed <= current_delta:
+        return [clamp_pulse(v) for v in motors]
+
+    factor = float(kick_speed) / float(current_delta)
+    return [clamp_pulse(base + (int(v) - base) * factor) for v in motors]
+
+
 @dataclass
 class TeleopCommand:
     name: str
@@ -172,6 +187,18 @@ class CarHardware:
 
     def run_motors(self, motors: Sequence[int]) -> None:
         self.run_raw(*[int(v) for v in motors])
+
+    def run_motors_with_kick(
+        self,
+        steady_motors: Sequence[int],
+        kick_motors: Sequence[int],
+        kick_duration: float,
+    ) -> None:
+        kick_duration = max(0.0, min(float(kick_duration), 0.25))
+        if kick_duration > 0 and motor_delta(steady_motors) > 0:
+            self.run_motors(kick_motors)
+            time.sleep(kick_duration)
+        self.run_motors(steady_motors)
 
     def run_action(self, action: Sequence[float], scale: float = 300.0) -> List[int]:
         motors = waypoint_to_motor(action, scale=scale)

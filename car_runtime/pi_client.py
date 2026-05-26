@@ -12,11 +12,11 @@ import sys
 import time
 
 try:
-    from car_hardware import CarHardware
+    from car_hardware import CarHardware, NEUTRAL, boosted_motors, motor_delta
     from car_protocol import recv_json, send_jpeg_frame, send_json
     from process_cleanup import cleanup_named_processes
 except ImportError:
-    from car_runtime.car_hardware import CarHardware
+    from car_runtime.car_hardware import CarHardware, NEUTRAL, boosted_motors, motor_delta
     from car_runtime.car_protocol import recv_json, send_jpeg_frame, send_json
     from car_runtime.process_cleanup import cleanup_named_processes
 
@@ -45,6 +45,19 @@ def connect_server(server_ip, server_port, connect_timeout, frame_timeout, hello
     return sock
 
 
+def motor_direction(motors):
+    direction = []
+    for value in motors:
+        delta = int(value) - NEUTRAL
+        if delta > 20:
+            direction.append(1)
+        elif delta < -20:
+            direction.append(-1)
+        else:
+            direction.append(0)
+    return tuple(direction)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server_ip", default="192.168.12.100")
@@ -58,6 +71,12 @@ def main():
     ap.add_argument("--dry_run", action="store_true")
     ap.add_argument("--uart_port", default=None, help="UART device, for example /dev/ttyAMA0 or /dev/serial0.")
     ap.add_argument("--reset_servos", action="store_true", help="Reset pan/tilt servos on startup.")
+    ap.add_argument("--kick_speed", type=int, default=0,
+                    help="Optional short startup kick pulse delta for received motor commands. Use 0 to disable.")
+    ap.add_argument("--kick_duration", type=float, default=0.06,
+                    help="Kick duration in seconds, clamped to 0.25.")
+    ap.add_argument("--kick_repeat", type=float, default=0.75,
+                    help="Minimum seconds between repeated kicks while receiving the same direction.")
     ap.add_argument("--no_cleanup_processes", action="store_true",
                     help="Do not kill vendor camera/main processes before opening hardware.")
     ap.add_argument("--cleanup_dry_run", action="store_true",
@@ -103,6 +122,8 @@ def main():
         time.sleep(1.0)
 
         frame_idx = 0
+        last_direction = motor_direction([NEUTRAL, NEUTRAL, NEUTRAL, NEUTRAL])
+        last_kick_time = 0.0
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -116,7 +137,24 @@ def main():
 
             # Execute motor command
             motors = cmd.get("motors", [1500, 1500, 1500, 1500])
-            hardware.run_motors(motors)
+            now = time.time()
+            direction = motor_direction(motors)
+            kick_speed = max(0, min(args.kick_speed, 900))
+            kick_duration = max(0.0, min(args.kick_duration, 0.25))
+            direction_changed = direction != last_direction
+            repeat_due = args.kick_repeat > 0 and (now - last_kick_time) >= args.kick_repeat
+            should_kick = (
+                kick_speed > 0
+                and motor_delta(motors) > 0
+                and kick_duration > 0
+                and (direction_changed or repeat_due)
+            )
+            if should_kick:
+                hardware.run_motors_with_kick(motors, boosted_motors(motors, kick_speed), kick_duration)
+                last_kick_time = now
+            else:
+                hardware.run_motors(motors)
+            last_direction = direction
 
             # Execute pan-tilt
             if "pan" in cmd:

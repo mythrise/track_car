@@ -75,6 +75,18 @@ Real movement:
 python3 car_runtime/move_test.py --move forward --speed 200 --duration 0.3 --execute
 ```
 
+Short startup kick for weak low-speed starts:
+
+```bash
+python3 car_runtime/move_test.py \
+  --move forward \
+  --speed 160 \
+  --kick_speed 350 \
+  --kick_duration 0.06 \
+  --duration 0.3 \
+  --execute
+```
+
 Keep the car lifted or in a clear low-speed area before using `--execute`.
 
 If your Raspberry Pi uses a different UART device:
@@ -116,3 +128,29 @@ hardware.
 The project now sends the same UART protocol shown in the vendor infrared
 remote example directly through `uart_transport.py`; a separate vendor
 `z_uart.py` file is no longer required for our runtime.
+
+## Startup Kick
+
+Some motors do not move at low steady pulse deltas because static friction is
+higher than rolling friction. Use a short kick instead of raising the whole
+run speed:
+
+```text
+steady speed: 120-220
+kick speed:   300-450
+duration:     0.04-0.08 seconds
+```
+
+Start conservative. `kick_duration` is clamped to at most `0.25` seconds in
+code.
+
+`pi_client.py` also supports the same idea for commands received from the
+Windows server:
+
+```bash
+python3 car_runtime/pi_client.py \
+  --server_ip <Windows_IP> \
+  --server_port 9999 \
+  --kick_speed 350 \
+  --kick_duration 0.06
+```

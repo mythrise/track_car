@@ -114,54 +114,14 @@ def default_device():
     return "cpu"
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=None)
-    ap.add_argument("--port", type=int, default=9999)
-    ap.add_argument("--device", default=None)
-    ap.add_argument("--opentrackvla_root", default=None,
-                    help="Path to the full OpenTrackVLA repo for non-mock model inference.")
-    ap.add_argument("--mock_control", action="store_true",
-                    help="Do not load the model; return a fixed safe command for protocol testing.")
-    ap.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
-    ap.add_argument("--mock_speed", type=int, default=200)
-    ap.add_argument("--timeout", type=float, default=2.0)
-    ap.add_argument("--no_cleanup_port", action="store_true",
-                    help="Do not kill an existing process listening on --port before startup.")
-    ap.add_argument("--cleanup_dry_run", action="store_true",
-                    help="Print cleanup targets without killing them.")
-    args = ap.parse_args()
-
-    if not args.no_cleanup_port:
-        cleanup_port(args.port, dry_run=args.cleanup_dry_run)
-        if args.cleanup_dry_run:
-            return
-
-    if args.mock_control:
-        device = None
-        model = None
-    else:
-        import torch
-        opentrackvla_root = resolve_opentrackvla_root(args.opentrackvla_root)
-        device = torch.device(args.device or default_device())
-        model = load_model(args.ckpt, device, opentrackvla_root)
-
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", args.port))
-    server.listen(1)
-    print(f"[server] listening on port {args.port}...")
-
-    conn, addr = server.accept()
+def handle_connection(conn, addr, args, model, device):
     conn.settimeout(args.timeout)
     print(f"[server] connected: {addr}")
 
     hello = recv_json(conn)
     if hello is None:
-        print("[server] client disconnected before hello")
-        conn.close()
-        server.close()
-        return
+        print("[server] client disconnected before hello; waiting for next client")
+        return 0
     instruction = hello.get("instruction", "follow the person")
     print(f"[server] instruction: {instruction}")
 
@@ -229,12 +189,64 @@ def main():
 
     except socket.timeout:
         print("[server] socket timeout")
-    except (KeyboardInterrupt, ConnectionResetError, ConnectionError, OSError) as exc:
+    except (ConnectionResetError, ConnectionError, OSError) as exc:
         print(f"[server] connection closed: {exc}")
     finally:
-        conn.close()
+        print(f"[server] client done. processed {frame_count} frames.")
+    return frame_count
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", default=None)
+    ap.add_argument("--port", type=int, default=9999)
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--opentrackvla_root", default=None,
+                    help="Path to the full OpenTrackVLA repo for non-mock model inference.")
+    ap.add_argument("--mock_control", action="store_true",
+                    help="Do not load the model; return a fixed safe command for protocol testing.")
+    ap.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
+    ap.add_argument("--mock_speed", type=int, default=200)
+    ap.add_argument("--timeout", type=float, default=2.0)
+    ap.add_argument("--no_cleanup_port", action="store_true",
+                    help="Do not kill an existing process listening on --port before startup.")
+    ap.add_argument("--cleanup_dry_run", action="store_true",
+                    help="Print cleanup targets without killing them.")
+    args = ap.parse_args()
+
+    if not args.no_cleanup_port:
+        cleanup_port(args.port, dry_run=args.cleanup_dry_run)
+        if args.cleanup_dry_run:
+            return
+
+    if args.mock_control:
+        device = None
+        model = None
+    else:
+        import torch
+        opentrackvla_root = resolve_opentrackvla_root(args.opentrackvla_root)
+        device = torch.device(args.device or default_device())
+        model = load_model(args.ckpt, device, opentrackvla_root)
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", args.port))
+    server.listen(1)
+    print(f"[server] listening on port {args.port}...")
+
+    total_frames = 0
+    try:
+        while True:
+            conn, addr = server.accept()
+            try:
+                total_frames += handle_connection(conn, addr, args, model, device)
+            finally:
+                conn.close()
+    except KeyboardInterrupt:
+        print("[server] interrupted")
+    finally:
         server.close()
-        print(f"[server] shutdown. processed {frame_count} frames.")
+        print(f"[server] shutdown. processed {total_frames} total frames.")
 
 
 if __name__ == "__main__":

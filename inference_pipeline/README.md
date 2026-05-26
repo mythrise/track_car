@@ -41,6 +41,9 @@ python inference_pipeline/mac_server.py \
   --no_cleanup_port
 ```
 
+The server keeps listening after a client disconnects, so `nc`/TCP probe tests
+will not force you to restart it.
+
 ## Full Model Server
 
 ```bash
