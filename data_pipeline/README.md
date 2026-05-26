@@ -56,6 +56,8 @@ camera latency directly:
 python3 car_runtime/camera_check.py
 python3 car_runtime/camera_check.py --camera_backend picamera2
 python3 car_runtime/camera_check.py --camera_backend v4l2
+python3 car_runtime/camera_check.py --camera_backend v4l2 --camera_fourcc MJPG
+python3 car_runtime/camera_check.py --camera_backend v4l2 --camera_fourcc YUYV
 ```
 
 For Raspberry Pi CSI cameras, prefer `picamera2`. Install it if needed:
@@ -65,6 +67,11 @@ sudo apt update
 sudo apt install -y python3-picamera2
 ```
 
+On older Raspberry Pi OS images, `libcamera-hello` may be missing and the camera
+may appear as `mmal service ... /dev/video0`. In that legacy V4L2 mode, use
+`--camera_backend v4l2` and try `--camera_fourcc MJPG` or `--camera_fourcc YUYV`
+if OpenCV reports an unsupported pixel format.
+
 Then use the working backend in collection:
 
 ```bash
@@ -72,7 +79,8 @@ python3 data_pipeline/collect_data.py \
   --episode_name ep001 \
   --teleop keyboard \
   --speed 160 \
-  --camera_backend picamera2
+  --camera_backend v4l2 \
+  --camera_fourcc MJPG
 ```
 
 If low-speed `w/a/s/d` commands do not overcome static friction, add a short

@@ -75,6 +75,8 @@ Check camera startup time:
 python3 car_runtime/camera_check.py
 python3 car_runtime/camera_check.py --camera_backend picamera2
 python3 car_runtime/camera_check.py --camera_backend v4l2
+python3 car_runtime/camera_check.py --camera_backend v4l2 --camera_fourcc MJPG
+python3 car_runtime/camera_check.py --camera_backend v4l2 --camera_fourcc YUYV
 ```
 
 For Raspberry Pi CSI cameras, `picamera2` is usually the correct backend. If it
@@ -84,6 +86,11 @@ is missing:
 sudo apt update
 sudo apt install -y python3-picamera2
 ```
+
+On older Raspberry Pi OS images, `libcamera-hello` may be missing and the camera
+may appear as `mmal service ... /dev/video0`. In that legacy V4L2 mode, use
+`--camera_backend v4l2` and try `--camera_fourcc MJPG` or `--camera_fourcc YUYV`
+if OpenCV reports an unsupported pixel format.
 
 Check runtime dependencies:
 

@@ -68,6 +68,7 @@ def main():
     ap.add_argument("--height", type=int, default=240)
     ap.add_argument("--camera_index", type=int, default=0)
     ap.add_argument("--camera_backend", choices=BACKENDS, default="auto")
+    ap.add_argument("--camera_fourcc", default="auto", help="OpenCV/V4L2 pixel format, for example MJPG or YUYV.")
     ap.add_argument("--camera_warmup", type=float, default=1.0)
     ap.add_argument("--instruction", default="follow the person")
     ap.add_argument("--connect_timeout", type=float, default=5.0)
@@ -123,6 +124,7 @@ def main():
             args.width,
             args.height,
             max(0.0, min(args.camera_warmup, 5.0)),
+            fourcc=args.camera_fourcc,
         )
 
         print("[startup] opening car hardware", flush=True)
