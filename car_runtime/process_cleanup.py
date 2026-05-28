@@ -22,8 +22,39 @@ def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
     except OSError:
         return False
+
+
+def _sudo_kill_pid(pid: int, label: str, grace_s: float) -> bool:
+    term = _run(["sudo", "-n", "kill", "-TERM", str(pid)])
+    if term.returncode != 0:
+        detail = (term.stderr or term.stdout).strip()
+        print(
+            f"[cleanup] sudo kill failed for pid={pid} ({label}): {detail}. "
+            f"Run manually: sudo kill -9 {pid}",
+            flush=True,
+        )
+        return False
+
+    time.sleep(grace_s)
+    if _pid_alive(pid):
+        kill = _run(["sudo", "-n", "kill", "-KILL", str(pid)])
+        if kill.returncode != 0:
+            detail = (kill.stderr or kill.stdout).strip()
+            print(
+                f"[cleanup] sudo kill -9 failed for pid={pid} ({label}): {detail}. "
+                f"Run manually: sudo kill -9 {pid}",
+                flush=True,
+            )
+            return False
+
+    print(f"[cleanup] killed pid={pid} ({label}) with sudo", flush=True)
+    return True
 
 
 def _kill_pid(pid: int, label: str, dry_run: bool = False, grace_s: float = 0.25) -> bool:
@@ -49,7 +80,8 @@ def _kill_pid(pid: int, label: str, dry_run: bool = False, grace_s: float = 0.25
         print(f"[cleanup] killed pid={pid} ({label})")
         return True
     except PermissionError:
-        print(f"[cleanup] permission denied killing pid={pid} ({label}); try sudo or stop it manually")
+        print(f"[cleanup] permission denied killing pid={pid} ({label}); trying sudo", flush=True)
+        return _sudo_kill_pid(pid, label, grace_s)
     except ProcessLookupError:
         return False
     except OSError as exc:
