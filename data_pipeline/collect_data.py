@@ -89,6 +89,9 @@ def main():
     ap.add_argument("--camera_index", type=int, default=0)
     ap.add_argument("--camera_backend", choices=BACKENDS, default="auto")
     ap.add_argument("--camera_fourcc", default="auto", help="OpenCV/V4L2 pixel format, for example MJPG or YUYV.")
+    ap.add_argument("--camera_fps", type=float, default=30.0)
+    ap.add_argument("--camera_saturation", type=float, default=40.0)
+    ap.add_argument("--camera_ready_timeout", type=float, default=5.0)
     ap.add_argument("--camera_warmup", type=float, default=1.0)
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--out_root", default="data/collected")
@@ -151,6 +154,9 @@ def main():
             args.height,
             max(0.0, min(args.camera_warmup, 5.0)),
             fourcc=args.camera_fourcc,
+            fps=args.camera_fps,
+            saturation=args.camera_saturation,
+            ready_timeout=args.camera_ready_timeout,
         )
 
         print(f"[collect] saving to {save_dir}, press Ctrl+C to stop")
@@ -238,6 +244,9 @@ def main():
             "fps": fps,
             "camera_backend": args.camera_backend,
             "camera_fourcc": args.camera_fourcc,
+            "camera_fps": args.camera_fps,
+            "camera_saturation": args.camera_saturation,
+            "camera_ready_timeout": args.camera_ready_timeout,
             "teleop": args.teleop,
             "speed": speed,
             "kick_speed": kick_speed,

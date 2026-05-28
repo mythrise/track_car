@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import time
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
 import cv2
 
 
-BACKENDS = ("auto", "picamera2", "opencv", "v4l2")
+BACKENDS = ("auto", "v4l2", "opencv", "picamera2")
 
 
 def cv_backend(name: str):
@@ -36,6 +37,119 @@ def _fourcc_to_string(value: float) -> str:
         return "unknown"
     chars = [chr((code >> 8 * i) & 0xFF) for i in range(4)]
     return "".join(ch if ch.isprintable() else "?" for ch in chars)
+
+
+class ThreadedOpenCVCamera:
+    """OpenCV camera wrapper based on the proven vendor Camera.py behavior."""
+
+    def __init__(
+        self,
+        index: int,
+        backend: str,
+        width: int,
+        height: int,
+        fourcc: Optional[str],
+        fps: float,
+        saturation: float,
+        ready_timeout: float,
+    ) -> None:
+        self.index = int(index)
+        self.backend = backend
+        self.width = int(width)
+        self.height = int(height)
+        self.fourcc = fourcc
+        self.fps = float(fps)
+        self.saturation = float(saturation)
+        self.ready_timeout = max(0.1, float(ready_timeout))
+        self.cap = None
+        self.opened = False
+        self.frame = None
+        self.frame_ok = False
+        self._last_error = None
+        self._lock = threading.Lock()
+        self._thread = None
+
+    def open(self) -> None:
+        if self.backend == "v4l2":
+            self.cap = cv2.VideoCapture(self.index, cv_backend("v4l2"))
+        else:
+            self.cap = cv2.VideoCapture(self.index)
+
+        if not self.cap.isOpened():
+            self.cap.release()
+            raise RuntimeError(f"OpenCV backend {self.backend} could not open camera index {self.index}")
+
+        if self.fourcc:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*self.fourcc))
+        if self.fps > 0:
+            self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        if self.saturation >= 0:
+            self.cap.set(cv2.CAP_PROP_SATURATION, self.saturation)
+        if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        actual_fourcc = _fourcc_to_string(self.cap.get(cv2.CAP_PROP_FOURCC))
+        actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
+        actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print(
+            f"[camera] opencv actual_fourcc={actual_fourcc} fps={actual_fps:.1f} "
+            f"size={actual_width}x{actual_height}",
+            flush=True,
+        )
+
+        self.opened = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+        self.wait_until_ready()
+
+    def _reader(self) -> None:
+        while self.opened:
+            try:
+                ok, frame = self.cap.read()
+            except Exception as exc:
+                self._last_error = exc
+                ok, frame = False, None
+
+            with self._lock:
+                self.frame_ok = bool(ok and frame is not None)
+                if self.frame_ok:
+                    self.frame = frame
+
+            if not ok:
+                time.sleep(0.01)
+
+    def wait_until_ready(self) -> None:
+        deadline = time.time() + self.ready_timeout
+        while time.time() < deadline:
+            with self._lock:
+                ready = self.frame_ok and self.frame is not None
+            if ready:
+                print("[camera] first frame ready", flush=True)
+                return
+            time.sleep(0.01)
+        raise RuntimeError(
+            f"Camera opened but no frame arrived within {self.ready_timeout:.1f}s"
+            + (f": {self._last_error}" if self._last_error else "")
+        )
+
+    def read(self):
+        with self._lock:
+            ok = self.frame_ok and self.frame is not None
+            frame = None if self.frame is None else self.frame.copy()
+        return ok, frame
+
+    def release(self) -> None:
+        self.opened = False
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        print("[camera] closed", flush=True)
 
 
 @dataclass
@@ -76,20 +190,32 @@ def _open_picamera2(index: int, width: int, height: int) -> CameraSource:
     return CameraSource("picamera2", camera)
 
 
-def _open_opencv(index: int, backend: str, width: int, height: int, fourcc: Optional[str]) -> CameraSource:
-    cap = cv2.VideoCapture(index, cv_backend(backend)) if backend == "v4l2" else cv2.VideoCapture(index)
-    if not cap.isOpened():
-        cap.release()
-        raise RuntimeError(f"OpenCV backend {backend} could not open camera index {index}")
-    if fourcc:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
-    cap.set(3, width)
-    cap.set(4, height)
-    if hasattr(cv2, "CAP_PROP_BUFFERSIZE"):
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    actual_fourcc = _fourcc_to_string(cap.get(cv2.CAP_PROP_FOURCC))
-    print(f"[camera] opencv actual_fourcc={actual_fourcc}", flush=True)
-    return CameraSource(backend, cap)
+def _open_opencv(
+    index: int,
+    backend: str,
+    width: int,
+    height: int,
+    fourcc: Optional[str],
+    fps: float,
+    saturation: float,
+    ready_timeout: float,
+) -> CameraSource:
+    camera = ThreadedOpenCVCamera(
+        index=index,
+        backend=backend,
+        width=width,
+        height=height,
+        fourcc=fourcc,
+        fps=fps,
+        saturation=saturation,
+        ready_timeout=ready_timeout,
+    )
+    try:
+        camera.open()
+    except Exception:
+        camera.release()
+        raise
+    return CameraSource(backend, camera)
 
 
 def open_camera(
@@ -99,25 +225,41 @@ def open_camera(
     height: int,
     warmup: float,
     fourcc: Optional[str] = None,
+    fps: float = 30.0,
+    saturation: float = 40.0,
+    ready_timeout: float = 5.0,
 ) -> CameraSource:
     if backend not in BACKENDS:
         raise ValueError(f"Unsupported camera backend: {backend}")
 
     fourcc_value = _normalize_fourcc(fourcc)
-    candidates = ["picamera2", "opencv", "v4l2"] if backend == "auto" else [backend]
+    candidates = ["v4l2", "opencv", "picamera2"] if backend == "auto" else [backend]
     errors = []
     for candidate in candidates:
         t0 = time.time()
-        fourcc_text = fourcc_value or "auto"
+        candidate_fourcc = fourcc_value
+        if candidate == "v4l2" and candidate_fourcc is None:
+            candidate_fourcc = "MJPG"
+        fourcc_text = candidate_fourcc or "auto"
         print(
-            f"[camera] trying backend={candidate} index={index} size={width}x{height} fourcc={fourcc_text}",
+            f"[camera] trying backend={candidate} index={index} size={width}x{height} "
+            f"fourcc={fourcc_text} fps={fps:g}",
             flush=True,
         )
         try:
             if candidate == "picamera2":
                 source = _open_picamera2(index, width, height)
             else:
-                source = _open_opencv(index, candidate, width, height, fourcc_value)
+                source = _open_opencv(
+                    index,
+                    candidate,
+                    width,
+                    height,
+                    candidate_fourcc,
+                    fps,
+                    saturation,
+                    ready_timeout,
+                )
             if warmup > 0:
                 time.sleep(warmup)
             print(f"[camera] opened backend={source.backend} open_time={time.time() - t0:.3f}s", flush=True)

@@ -58,13 +58,18 @@ camera latency directly:
 
 ```bash
 python3 car_runtime/camera_check.py
-python3 car_runtime/camera_check.py --camera_backend picamera2
 python3 car_runtime/camera_check.py --camera_backend v4l2
 python3 car_runtime/camera_check.py --camera_backend v4l2 --camera_fourcc MJPG
 python3 car_runtime/camera_check.py --camera_backend v4l2 --camera_fourcc YUYV
+python3 car_runtime/camera_check.py --camera_backend picamera2
 ```
 
-For Raspberry Pi CSI cameras, prefer `picamera2`. Install it if needed:
+The V4L2 backend follows the proven vendor `Camera.py` behavior: it opens
+`/dev/video0` with `cv2.CAP_V4L2`, defaults to `MJPG`, sets `30 FPS`,
+applies the requested size, and reads frames continuously in a background
+thread. For this car, test `v4l2` before `picamera2`.
+
+If `picamera2` is needed and missing:
 
 ```bash
 sudo apt update

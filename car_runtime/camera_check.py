@@ -17,6 +17,9 @@ def main() -> None:
     ap.add_argument("--camera_index", type=int, default=0)
     ap.add_argument("--camera_backend", choices=BACKENDS, default="auto")
     ap.add_argument("--camera_fourcc", default="auto", help="OpenCV/V4L2 pixel format, for example MJPG or YUYV.")
+    ap.add_argument("--camera_fps", type=float, default=30.0)
+    ap.add_argument("--camera_saturation", type=float, default=40.0)
+    ap.add_argument("--camera_ready_timeout", type=float, default=5.0)
     ap.add_argument("--width", type=int, default=320)
     ap.add_argument("--height", type=int, default=240)
     ap.add_argument("--frames", type=int, default=5)
@@ -29,6 +32,9 @@ def main() -> None:
         args.height,
         warmup=0.0,
         fourcc=args.camera_fourcc,
+        fps=args.camera_fps,
+        saturation=args.camera_saturation,
+        ready_timeout=args.camera_ready_timeout,
     )
 
     for i in range(max(1, args.frames)):
