@@ -39,6 +39,20 @@ def _fourcc_to_string(value: float) -> str:
     return "".join(ch if ch.isprintable() else "?" for ch in chars)
 
 
+def _video_capture(index: int, backend: str):
+    """Create VideoCapture while supporting older Raspberry Pi OpenCV builds."""
+    if backend == "v4l2":
+        try:
+            return cv2.VideoCapture(index, cv_backend("v4l2"))
+        except TypeError as exc:
+            print(
+                f"[camera] OpenCV does not support VideoCapture(index, apiPreference): {exc}; "
+                "falling back to VideoCapture(index)",
+                flush=True,
+            )
+    return cv2.VideoCapture(index)
+
+
 class ThreadedOpenCVCamera:
     """OpenCV camera wrapper based on the proven vendor Camera.py behavior."""
 
@@ -70,10 +84,7 @@ class ThreadedOpenCVCamera:
         self._thread = None
 
     def open(self) -> None:
-        if self.backend == "v4l2":
-            self.cap = cv2.VideoCapture(self.index, cv_backend("v4l2"))
-        else:
-            self.cap = cv2.VideoCapture(self.index)
+        self.cap = _video_capture(self.index, self.backend)
 
         if not self.cap.isOpened():
             self.cap.release()
