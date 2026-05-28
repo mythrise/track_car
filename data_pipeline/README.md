@@ -28,7 +28,7 @@ Each `meta_*.json` contains:
   "episode": "ep001",
   "teleop": "keyboard",
   "command": "forward",
-  "motors": [1300, 1700, 1300, 1700],
+  "motors": [1700, 1300, 1700, 1300],
   "action": [1.0, 0.0, 0.0]
 }
 ```
@@ -50,8 +50,8 @@ python3 data_pipeline/collect_data.py \
 
 Use `--dry_run` to record without moving hardware.
 
-Keyboard teleop uses the verified `MotionControl.py` motor mapping: left wheel
-PWM is `1500 - speed`, right wheel PWM is `1500 + speed`.
+Keyboard teleop uses the actual car motor mapping: left wheel
+PWM is `1500 + speed`, right wheel PWM is `1500 - speed`.
 
 If startup pauses after UART opens, it is usually waiting for the camera. Test
 camera latency directly:

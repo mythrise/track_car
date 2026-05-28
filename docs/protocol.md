@@ -54,22 +54,22 @@ loop:
 #006PxxxxT0000!#007PxxxxT0000!#008PxxxxT0000!#009PxxxxT0000!
 ```
 
-The runtime follows the verified `MotionControl.py` mapping:
+The runtime follows the actual car motor mapping:
 
 ```text
-left wheels:  PWM = 1500 - speed
-right wheels: PWM = 1500 + speed
+left wheels:  PWM = 1500 + speed
+right wheels: PWM = 1500 - speed
 ```
 
 For `speed=400`, the keyboard primitives produce:
 
 ```text
-forward:      [1100, 1900, 1100, 1900]
-backward:     [1900, 1100, 1900, 1100]
-turn_left:    [1900, 1900, 1900, 1900]
-turn_right:   [1100, 1100, 1100, 1100]
-strafe_left:  [1900, 1900, 1100, 1100]
-strafe_right: [1100, 1100, 1900, 1900]
+forward:      [1900, 1100, 1900, 1100]
+backward:     [1100, 1900, 1100, 1900]
+turn_left:    [1100, 1100, 1100, 1100]
+turn_right:   [1900, 1900, 1900, 1900]
+strafe_left:  [1100, 1100, 1900, 1900]
+strafe_right: [1900, 1900, 1100, 1100]
 ```
 
 Stop command:

@@ -64,18 +64,18 @@ def format_motor_command(l1: int, r1: int, l2: int, r2: int, time_ms: int = 0) -
 
 
 def speed_to_pwm(speed_l1: int, speed_r1: int, speed_l2: int, speed_r2: int) -> List[int]:
-    """Convert verified MotionControl wheel speeds to controller PWM pulses.
+    """Convert calibrated wheel speeds to controller PWM pulses.
 
-    The proven car wiring uses:
-      left wheels:  PWM = 1500 - speed
-      right wheels: PWM = 1500 + speed
+    The current car wiring uses:
+      left wheels:  PWM = 1500 + speed
+      right wheels: PWM = 1500 - speed
     Positive speed means physical forward for that wheel.
     """
     return [
-        clamp_pulse(NEUTRAL - clamp_speed(speed_l1)),
-        clamp_pulse(NEUTRAL + clamp_speed(speed_r1)),
-        clamp_pulse(NEUTRAL - clamp_speed(speed_l2)),
-        clamp_pulse(NEUTRAL + clamp_speed(speed_r2)),
+        clamp_pulse(NEUTRAL + clamp_speed(speed_l1)),
+        clamp_pulse(NEUTRAL - clamp_speed(speed_r1)),
+        clamp_pulse(NEUTRAL + clamp_speed(speed_l2)),
+        clamp_pulse(NEUTRAL - clamp_speed(speed_r2)),
     ]
 
 
@@ -112,13 +112,13 @@ def wheel_speeds_to_action(speeds: Sequence[float], scale: float = 300.0) -> Lis
 
 
 def motor_pulses_to_speeds(motors: Sequence[int], base: int = NEUTRAL) -> List[int]:
-    """Convert logged motor PWM pulses back to MotionControl wheel speeds."""
+    """Convert logged motor PWM pulses back to calibrated wheel speeds."""
     l1, r1, l2, r2 = [int(v) for v in motors]
     return [
-        clamp_speed(base - l1),
-        clamp_speed(r1 - base),
-        clamp_speed(base - l2),
-        clamp_speed(r2 - base),
+        clamp_speed(l1 - base),
+        clamp_speed(base - r1),
+        clamp_speed(l2 - base),
+        clamp_speed(base - r2),
     ]
 
 

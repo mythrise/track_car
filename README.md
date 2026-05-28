@@ -129,8 +129,8 @@ python3 car_runtime/move_test.py --move forward --speed 200 --duration 0.3
 python3 car_runtime/move_test.py --move forward --speed 200 --duration 0.3 --execute
 ```
 
-Motor mapping is synced with the verified `MotionControl.py`: left wheel PWM is
-`1500 - speed`, right wheel PWM is `1500 + speed`.
+Motor mapping is calibrated to the actual car: left wheel PWM is
+`1500 + speed`, right wheel PWM is `1500 - speed`.
 
 ### 2. Data Pipeline
 

@@ -69,22 +69,22 @@ run the client with sufficient permissions for that test.
 
 ## Direct Motor Test
 
-Motor control now follows the verified `MotionControl.py` wiring:
+Motor control is calibrated to the actual car wiring:
 
 ```text
-left wheels:  PWM = 1500 - speed
-right wheels: PWM = 1500 + speed
+left wheels:  PWM = 1500 + speed
+right wheels: PWM = 1500 - speed
 ```
 
 For `--speed 400`, `move_test.py` sends:
 
 ```text
-forward:      [1100, 1900, 1100, 1900]
-backward:     [1900, 1100, 1900, 1100]
-left turn:    [1900, 1900, 1900, 1900]
-right turn:   [1100, 1100, 1100, 1100]
-strafe_left:  [1900, 1900, 1100, 1100]
-strafe_right: [1100, 1100, 1900, 1900]
+forward:      [1900, 1100, 1900, 1100]
+backward:     [1100, 1900, 1100, 1900]
+left turn:    [1100, 1100, 1100, 1100]
+right turn:   [1900, 1900, 1900, 1900]
+strafe_left:  [1100, 1100, 1900, 1900]
+strafe_right: [1900, 1900, 1100, 1100]
 ```
 
 Check camera startup time:
