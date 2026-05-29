@@ -2,7 +2,7 @@
 """Mac inference server — receives frames from Pi, runs PFEM-Harness, sends commands.
 
 Run on your Mac/PC:
-    python inference_pipeline/mac_server.py --ckpt ckpts_pfem/pfem_epoch0.pt --port 9999
+    python inference_pipeline/mac_server.py --port 9999
 """
 
 import argparse
@@ -28,11 +28,18 @@ except ImportError:
     from car_runtime.process_cleanup import cleanup_port
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BUNDLED_OPENTRACKVLA_ROOT = PROJECT_ROOT / "third_party" / "OpenTrackVLA"
+
+
 def resolve_opentrackvla_root(root_arg):
     root = root_arg or os.environ.get("OPENTRACKVLA_ROOT")
+    if root is None and (BUNDLED_OPENTRACKVLA_ROOT / "model.py").exists():
+        root = BUNDLED_OPENTRACKVLA_ROOT
     if root is None:
         raise RuntimeError(
-            "Full model mode requires --opentrackvla_root or OPENTRACKVLA_ROOT. "
+            "Full model mode requires bundled third_party/OpenTrackVLA, "
+            "--opentrackvla_root, or OPENTRACKVLA_ROOT. "
             "Use --mock_control for protocol testing without OpenTrackVLA."
         )
     root_path = Path(root).expanduser().resolve()
@@ -41,12 +48,71 @@ def resolve_opentrackvla_root(root_arg):
     return root_path
 
 
+def default_existing_path(*paths):
+    for path in paths:
+        if path is None:
+            continue
+        p = Path(path).expanduser()
+        if p.exists():
+            return str(p.resolve())
+    return None
+
+
+def configure_default_weight_paths(args, opentrackvla_root):
+    if args.qwen_model_path:
+        os.environ["QWEN_MODEL_PATH"] = str(Path(args.qwen_model_path).expanduser().resolve())
+    else:
+        qwen_path = default_existing_path(
+            opentrackvla_root / "ckpts_hf" / "qwen3-0.6b",
+            opentrackvla_root / "ckpts_hf" / "Qwen3-0.6B",
+        )
+        if qwen_path:
+            os.environ.setdefault("QWEN_MODEL_PATH", qwen_path)
+
+    if args.siglip_model_path:
+        os.environ["SIGLIP_MODEL_PATH"] = str(Path(args.siglip_model_path).expanduser().resolve())
+    else:
+        siglip_path = default_existing_path(
+            opentrackvla_root / "ckpts_hf" / "siglip-so400m-patch14-384",
+        )
+        if siglip_path:
+            os.environ.setdefault("SIGLIP_MODEL_PATH", siglip_path)
+
+    if args.dinov3_model_path:
+        os.environ["DINOV3_MODEL_PATH"] = str(Path(args.dinov3_model_path).expanduser().resolve())
+    else:
+        dinov3_path = default_existing_path(
+            PROJECT_ROOT / "weights" / "modelscope" / "dinov3-vits16-pretrain-lvd1689m",
+            opentrackvla_root / "ckpts_hf" / "dinov3-vits16-pretrain-lvd1689m",
+        )
+        if dinov3_path:
+            os.environ.setdefault("DINOV3_MODEL_PATH", dinov3_path)
+
+    if args.base_hf_model_dir is None:
+        args.base_hf_model_dir = default_existing_path(
+            opentrackvla_root / "ckpts_hf" / "opentrackvla-qwen06b",
+        )
+    elif args.base_hf_model_dir:
+        args.base_hf_model_dir = str(Path(args.base_hf_model_dir).expanduser().resolve())
+
+    if args.ckpt is None:
+        args.ckpt = default_existing_path(
+            opentrackvla_root / "ckpts_pfem" / "car_official_dinov3" / "pfem_epoch0.pt",
+            opentrackvla_root / "ckpts_pfem" / "pfem_epoch0.pt",
+        )
+    elif args.ckpt:
+        args.ckpt = str(Path(args.ckpt).expanduser().resolve())
+
+
 def load_official_base(base_hf_model_dir):
     from safetensors.torch import load_file as load_safetensors
     from open_trackvla_hf import OpenTrackVLAConfig, OpenTrackVLAForWaypoint
 
-    base_hf_dir = Path(base_hf_model_dir)
+    base_hf_dir = Path(base_hf_model_dir).expanduser().resolve()
     hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir))
+    qwen_model_path = os.environ.get("QWEN_MODEL_PATH", "").strip()
+    if qwen_model_path:
+        hf_config.llm_name = qwen_model_path
     hf_model = OpenTrackVLAForWaypoint(hf_config)
     state_path = base_hf_dir / "model.safetensors"
     if not state_path.exists():
@@ -66,7 +132,11 @@ def load_model(ckpt_path, device, opentrackvla_root, base_hf_model_dir=None):
     if base_hf_model_dir:
         base = load_official_base(base_hf_model_dir)
     else:
-        mcfg = ModelConfig(n_waypoints=8, freeze_llm=True)
+        mcfg = ModelConfig(
+            llm_name=os.environ.get("QWEN_MODEL_PATH", "Qwen/Qwen3-0.6B"),
+            n_waypoints=8,
+            freeze_llm=True,
+        )
         base = OpenTrackVLA(mcfg, vision_feat_dim=1536)
     base = base.to(device)
     model = PFEMHarness(base).to(device).eval()
@@ -230,11 +300,15 @@ def main():
     ap.add_argument("--port", type=int, default=9999)
     ap.add_argument("--device", default=None)
     ap.add_argument("--opentrackvla_root", default=None,
-                    help="Path to the full OpenTrackVLA repo for non-mock model inference.")
+                    help="Path to OpenTrackVLA source. Defaults to bundled third_party/OpenTrackVLA.")
     ap.add_argument("--base_hf_model_dir", default=None,
                     help="Official OpenTrackVLA HuggingFace checkpoint directory.")
+    ap.add_argument("--qwen_model_path", default=None,
+                    help="Optional local Qwen/Qwen3-0.6B directory for offline inference.")
     ap.add_argument("--dinov3_model_path", default=None,
                     help="Local DINOv3 model directory downloaded from ModelScope or HuggingFace.")
+    ap.add_argument("--siglip_model_path", default=None,
+                    help="Optional local SigLIP directory for offline inference.")
     ap.add_argument("--history", type=int, default=31)
     ap.add_argument("--mock_control", action="store_true",
                     help="Do not load the model; return a fixed safe command for protocol testing.")
@@ -258,13 +332,19 @@ def main():
         encoder = None
     else:
         import torch
-        from cache_gridpool import VisionCacheConfig, VisionFeatureCacher
 
         opentrackvla_root = resolve_opentrackvla_root(args.opentrackvla_root)
         sys.path.insert(0, str(opentrackvla_root))
-        if args.dinov3_model_path:
-            os.environ["DINOV3_MODEL_PATH"] = args.dinov3_model_path
+        configure_default_weight_paths(args, opentrackvla_root)
+        from cache_gridpool import VisionCacheConfig, VisionFeatureCacher
+
         device = torch.device(args.device or default_device())
+        print(f"[server] OpenTrackVLA root: {opentrackvla_root}")
+        print(f"[server] base_hf_model_dir: {args.base_hf_model_dir or '(not set)'}")
+        print(f"[server] pfem_ckpt: {args.ckpt or '(not set)'}")
+        print(f"[server] DINOV3_MODEL_PATH: {os.environ.get('DINOV3_MODEL_PATH', '(not set)')}")
+        print(f"[server] QWEN_MODEL_PATH: {os.environ.get('QWEN_MODEL_PATH', '(HF cache / online)')}")
+        print(f"[server] SIGLIP_MODEL_PATH: {os.environ.get('SIGLIP_MODEL_PATH', '(HF cache / online)')}")
         model = load_model(args.ckpt, device, opentrackvla_root, base_hf_model_dir=args.base_hf_model_dir)
         encoder_device = "cuda" if device.type == "cuda" else "cpu"
         encoder = VisionFeatureCacher(VisionCacheConfig(image_size=384, batch_size=1, device=encoder_device))

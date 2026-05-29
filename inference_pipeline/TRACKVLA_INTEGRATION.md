@@ -1,15 +1,18 @@
 # TrackVLA / OpenTrackVLA Integration
 
-This repository does not vendor the full OpenTrackVLA codebase. Full inference
-expects the separate project to exist locally:
+This repository vendors the PFEM-capable OpenTrackVLA source needed for car
+inference and training under `third_party/OpenTrackVLA`. Full inference expects
+that source plus local weights:
 
 ```text
-/path/to/OpenTrackVLA/
+track_car/third_party/OpenTrackVLA/
   model.py
   harness/
   cache_gridpool.py
   ckpts_hf/opentrackvla-qwen06b/
-  ckpts_pfem/
+  ckpts_pfem/car_official_dinov3/pfem_epoch0.pt
+
+track_car/weights/modelscope/dinov3-vits16-pretrain-lvd1689m/
 ```
 
 ## Recommended Model Stack
@@ -30,7 +33,7 @@ Raspberry Pi executor
 | --- | --- |
 | `opentrackvla-qwen06b` | Base OpenTrackVLA Qwen0.6B planner checkpoint. |
 | `Qwen/Qwen3-0.6B` | Native LLM backbone loaded by OpenTrackVLA `model.py`. |
-| `pfem_epoch*.pt` | PFEM-Harness checkpoint trained on collected/sim data. |
+| `pfem_epoch0.pt` | PFEM-Harness checkpoint trained on collected car data. |
 | `facebook/dinov3-vits16-pretrain-lvd1689m` | Official DINOv3 visual tower; gated on Hugging Face. |
 | `google/siglip-so400m-patch14-384` | SigLIP visual tower used with DINOv3. |
 

@@ -11,7 +11,7 @@ commands.
 | --- | --- | --- |
 | Mock stop | `--mock_control --mock_action stop` | Test TCP and camera without movement. |
 | Mock movement | `--mock_control --mock_action forward --mock_speed 150` | Lifted-car bounded movement test. |
-| Full model | `--opentrackvla_root /path/to/OpenTrackVLA --ckpt ...` | Load OpenTrackVLA/PFEM and return model commands. |
+| Full model | `--opentrackvla_root third_party/OpenTrackVLA --ckpt ...` | Load OpenTrackVLA/PFEM and return model commands. |
 
 ## Mock Server
 
@@ -55,8 +55,10 @@ will not force you to restart it.
 
 ```bash
 python inference_pipeline/mac_server.py \
-  --opentrackvla_root /Users/mythrise/科研实习/OpenTrackVLA \
-  --ckpt /Users/mythrise/科研实习/OpenTrackVLA/ckpts_pfem/pfem_epoch3.pt \
+  --opentrackvla_root third_party/OpenTrackVLA \
+  --base_hf_model_dir third_party/OpenTrackVLA/ckpts_hf/opentrackvla-qwen06b \
+  --ckpt third_party/OpenTrackVLA/ckpts_pfem/car_official_dinov3/pfem_epoch0.pt \
+  --dinov3_model_path weights/modelscope/dinov3-vits16-pretrain-lvd1689m \
   --port 9999
 ```
 
@@ -65,7 +67,6 @@ PFEM heads around the OpenTrackVLA base. That is useful only for plumbing tests.
 
 ## Important
 
-`mac_server.py` currently contains a lightweight placeholder `frame_to_tokens`
-path for non-mock model mode. For serious model results, replace it with the
-same SigLIP+DINOv2 `VisionFeatureCacher` path used in the full OpenTrackVLA
-project.
+`mac_server.py` now uses the bundled `third_party/OpenTrackVLA` source by
+default and encodes frames with the same DINOv3 + SigLIP path used by PFEM
+training. Put the required weights in the paths documented by `weights/README.md`.

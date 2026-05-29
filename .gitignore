@@ -20,3 +20,11 @@ world_rollouts/
 sim_data/
 weights/*.local.json
 weights/modelscope/
+third_party/OpenTrackVLA/ckpts_hf/
+third_party/OpenTrackVLA/ckpts/
+third_party/OpenTrackVLA/ckpts_pfem/
+third_party/OpenTrackVLA/data/
+third_party/OpenTrackVLA/logs/
+third_party/OpenTrackVLA/results/
+third_party/OpenTrackVLA/sim_data/
+third_party/OpenTrackVLA/infer*_out/

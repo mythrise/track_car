@@ -1,3 +1,7 @@
 numpy
 opencv-python
+Pillow
 pyserial
+safetensors
+torch
+transformers

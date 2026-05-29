@@ -53,15 +53,16 @@ Files:
 ```text
 inference_pipeline/mac_server.py
 inference_pipeline/TRACKVLA_INTEGRATION.md
+third_party/OpenTrackVLA/
 ```
 
 ## 4. Weight Pipeline
 
 ```text
 weights manifest
-  -> local OpenTrackVLA root
+  -> bundled OpenTrackVLA source root
   -> base Qwen0.6B weights
-  -> optional PFEM checkpoint
+  -> trained PFEM checkpoint
 ```
 
 Files:
@@ -74,5 +75,6 @@ weights/weights_manifest.example.json
 ## Current Reality
 
 The control and communication pipeline is runnable now. The full model pipeline
-still depends on the separate OpenTrackVLA project and should first be tested in
-mock mode.
+has source code in this repo under `third_party/OpenTrackVLA`, but still needs
+local weights in the paths documented by `weights/README.md`. Always test in
+mock mode before enabling real model control.
