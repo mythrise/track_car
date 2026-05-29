@@ -19,3 +19,4 @@ ckpts*/
 world_rollouts/
 sim_data/
 weights/*.local.json
+weights/modelscope/
