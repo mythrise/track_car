@@ -14,6 +14,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
@@ -40,48 +41,70 @@ def resolve_opentrackvla_root(root_arg):
     return root_path
 
 
-def load_model(ckpt_path, device, opentrackvla_root):
+def load_official_base(base_hf_model_dir):
+    from safetensors.torch import load_file as load_safetensors
+    from open_trackvla_hf import OpenTrackVLAConfig, OpenTrackVLAForWaypoint
+
+    base_hf_dir = Path(base_hf_model_dir)
+    hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir))
+    hf_model = OpenTrackVLAForWaypoint(hf_config)
+    state_path = base_hf_dir / "model.safetensors"
+    if not state_path.exists():
+        raise FileNotFoundError(f"Missing OpenTrackVLA HF weights: {state_path}")
+    missing, unexpected = hf_model.load_state_dict(load_safetensors(str(state_path)), strict=False)
+    print(f"[server] loaded official base: {len(missing)} missing, {len(unexpected)} unexpected")
+    return hf_model.model
+
+
+def load_model(ckpt_path, device, opentrackvla_root, base_hf_model_dir=None):
     import torch
 
     sys.path.insert(0, str(opentrackvla_root))
     from model import OpenTrackVLA, ModelConfig
     from harness.harness_wrapper import PFEMHarness
 
-    mcfg = ModelConfig(n_waypoints=8, freeze_llm=True)
-    base = OpenTrackVLA(mcfg, vision_feat_dim=1536).to(device)
+    if base_hf_model_dir:
+        base = load_official_base(base_hf_model_dir)
+    else:
+        mcfg = ModelConfig(n_waypoints=8, freeze_llm=True)
+        base = OpenTrackVLA(mcfg, vision_feat_dim=1536)
+    base = base.to(device)
     model = PFEMHarness(base).to(device).eval()
     if ckpt_path and Path(ckpt_path).exists():
         ckpt = torch.load(ckpt_path, map_location=device)
         msd = ckpt.get("model_state", {})
-        model.load_state_dict(msd, strict=False)
-        print(f"[server] loaded {ckpt_path}")
+        missing, unexpected = model.load_state_dict(msd, strict=False)
+        missing = [k for k in missing if not k.startswith("base.llm.")]
+        print(f"[server] loaded {ckpt_path}: {len(missing)} missing, {len(unexpected)} unexpected")
     return model
 
 
-def frame_to_tokens(frame, encoder=None):
-    """Convert a raw BGR frame to (coarse_tokens, fine_tokens) + tidx.
+def encode_frame(frame, encoder):
+    import torch
+    from cache_gridpool import grid_pool_tokens
 
-    In full deployment, this uses SigLIP+DINOv2. For quick testing without
-    those models, we use a random projection placeholder.
-    """
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(rgb).convert("RGB")
+    tok_dino, hp, wp = encoder._encode_dino([pil])
+    tok_sigl = encoder._encode_siglip([pil], out_hw=(hp, wp))
+    tokens = torch.cat([tok_dino, tok_sigl], dim=-1)
+    fine = grid_pool_tokens(tokens, hp, wp, out_tokens=64)[0].float()
+    coarse = grid_pool_tokens(tokens, hp, wp, out_tokens=4)[0].float()
+    return coarse, fine
+
+
+def build_tokens(coarse_history, fine_tokens, history):
     import torch
 
-    h, w = frame.shape[:2]
-    # Flatten + normalize to a 1536-d feature
-    small = cv2.resize(frame, (64, 48))
-    flat = small.astype(np.float32).flatten() / 255.0
-    # Pad/truncate to 1536
-    if len(flat) > 1536:
-        feat = flat[:1536]
-    else:
-        feat = np.pad(flat, (0, 1536 - len(flat)))
-    feat = torch.from_numpy(feat).float()
-
-    # Create fine tokens (64 tokens) and coarse tokens (31*4 tokens)
-    fine = feat.unsqueeze(0).unsqueeze(0).expand(1, 64, -1)
-    coarse = feat.unsqueeze(0).unsqueeze(0).expand(1, 124, -1)
-    fine_tidx = torch.full((1, 64), fill_value=31, dtype=torch.long)
-    coarse_tidx = torch.arange(31).repeat_interleave(4).unsqueeze(0)
+    frames = list(coarse_history[-history:])
+    if not frames:
+        raise RuntimeError("empty coarse history")
+    while len(frames) < history:
+        frames.insert(0, frames[0])
+    coarse = torch.cat(frames, dim=0).unsqueeze(0)
+    coarse_tidx = torch.arange(history).repeat_interleave(4).unsqueeze(0)
+    fine = fine_tokens.unsqueeze(0)
+    fine_tidx = torch.full((1, 64), fill_value=history, dtype=torch.long)
     return coarse, coarse_tidx, fine, fine_tidx
 
 
@@ -114,7 +137,7 @@ def default_device():
     return "cpu"
 
 
-def handle_connection(conn, addr, args, model, device):
+def handle_connection(conn, addr, args, model, encoder, device):
     conn.settimeout(args.timeout)
     print(f"[server] connected: {addr}")
 
@@ -127,6 +150,7 @@ def handle_connection(conn, addr, args, model, device):
 
     B = 1
     state = model.init_state(B, device) if model is not None else None
+    coarse_history = []
     pan, tilt = 1500, 1500
     frame_count = 0
 
@@ -145,7 +169,11 @@ def handle_connection(conn, addr, args, model, device):
             else:
                 import torch
 
-                coarse, c_tidx, fine, f_tidx = frame_to_tokens(frame)
+                coarse_frame, fine_frame = encode_frame(frame, encoder)
+                coarse_history.append(coarse_frame)
+                if len(coarse_history) > args.history:
+                    coarse_history = coarse_history[-args.history:]
+                coarse, c_tidx, fine, f_tidx = build_tokens(coarse_history, fine_frame, args.history)
 
                 with torch.inference_mode():
                     out = model.forward_step(
@@ -160,7 +188,7 @@ def handle_connection(conn, addr, args, model, device):
                 wp = out["waypoints"][0]  # (8, 3)
 
                 # Use waypoint[1] for motor command (same as trained_agent.py)
-                motors = waypoint_to_motor(wp[1])
+                motors = waypoint_to_motor(wp[1].detach().cpu().tolist())
 
                 # Use Polar-CoT for pan-tilt
                 cot_theta = out["cot_decoded"]["theta_deg"][0].item()
@@ -203,6 +231,11 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--opentrackvla_root", default=None,
                     help="Path to the full OpenTrackVLA repo for non-mock model inference.")
+    ap.add_argument("--base_hf_model_dir", default=None,
+                    help="Official OpenTrackVLA HuggingFace checkpoint directory.")
+    ap.add_argument("--dinov3_model_path", default=None,
+                    help="Local DINOv3 model directory downloaded from ModelScope or HuggingFace.")
+    ap.add_argument("--history", type=int, default=31)
     ap.add_argument("--mock_control", action="store_true",
                     help="Do not load the model; return a fixed safe command for protocol testing.")
     ap.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
@@ -222,11 +255,20 @@ def main():
     if args.mock_control:
         device = None
         model = None
+        encoder = None
     else:
         import torch
+        from cache_gridpool import VisionCacheConfig, VisionFeatureCacher
+
         opentrackvla_root = resolve_opentrackvla_root(args.opentrackvla_root)
+        sys.path.insert(0, str(opentrackvla_root))
+        if args.dinov3_model_path:
+            os.environ["DINOV3_MODEL_PATH"] = args.dinov3_model_path
         device = torch.device(args.device or default_device())
-        model = load_model(args.ckpt, device, opentrackvla_root)
+        model = load_model(args.ckpt, device, opentrackvla_root, base_hf_model_dir=args.base_hf_model_dir)
+        encoder_device = "cuda" if device.type == "cuda" else "cpu"
+        encoder = VisionFeatureCacher(VisionCacheConfig(image_size=384, batch_size=1, device=encoder_device))
+        encoder.eval()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -239,7 +281,7 @@ def main():
         while True:
             conn, addr = server.accept()
             try:
-                total_frames += handle_connection(conn, addr, args, model, device)
+                total_frames += handle_connection(conn, addr, args, model, encoder, device)
             finally:
                 conn.close()
     except KeyboardInterrupt:
