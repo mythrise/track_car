@@ -66,15 +66,31 @@ def discretize_dist(dist_m, n_dist=30, dmin=0.6, dmax=5.0):
     return min(int((dist_m - dmin) * n_dist / (dmax - dmin)), n_dist - 1)
 
 
+def load_json(path):
+    if not path.exists() or path.stat().st_size == 0:
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return None
+
+
 def load_meta(ep_dir, frame_idx):
-    meta_path = ep_dir / f"meta_{frame_idx:06d}.json"
-    if not meta_path.exists():
-        return {}
-    with open(meta_path) as f:
-        return json.load(f)
+    return load_json(ep_dir / f"meta_{frame_idx:06d}.json")
+
+
+def first_valid_meta(ep_dir):
+    for meta_path in sorted(ep_dir.glob("meta_*.json")):
+        meta = load_json(meta_path)
+        if meta is not None:
+            return meta
+    return None
 
 
 def meta_to_action(meta):
+    if meta is None:
+        return None
     if "action" in meta:
         return [float(v) for v in meta["action"]]
     if "motors" in meta:
@@ -89,7 +105,10 @@ def integrate_waypoints(ep_dir, start_idx, horizon, fps):
     actions = []
     for k in range(horizon):
         meta = load_meta(ep_dir, start_idx + k)
-        vx, vy, wz = meta_to_action(meta)
+        action = meta_to_action(meta)
+        if action is None:
+            return None, None
+        vx, vy, wz = action
         x += vx * dt
         y += vy * dt
         th += wz * dt
@@ -104,6 +123,11 @@ def main():
     ap.add_argument("--output", required=True)
     ap.add_argument("--history", type=int, default=31)
     ap.add_argument("--n_waypoints", type=int, default=8)
+    ap.add_argument(
+        "--absolute_paths",
+        action="store_true",
+        help="Write absolute image paths in JSONL. Recommended when training from another repo.",
+    )
     args = ap.parse_args()
 
     episodes = sorted(Path(args.input).iterdir())
@@ -116,8 +140,18 @@ def main():
         if not ep_json.exists():
             continue
 
-        with open(ep_json) as f:
-            ep_meta = json.load(f)
+        ep_meta = load_json(ep_json)
+        if ep_meta is None:
+            recovered = first_valid_meta(ep_dir)
+            if recovered is None:
+                print(f"  skip {ep_dir.name}: invalid episode.json and no valid meta")
+                continue
+            ep_meta = {
+                "episode": ep_dir.name,
+                "instruction": recovered.get("instruction", "follow the person"),
+                "fps": recovered.get("fps", 10),
+            }
+            print(f"  recover {ep_dir.name}: invalid episode.json, using first valid meta")
 
         frames = sorted(ep_dir.glob("frame_*.jpg"))
         if len(frames) < args.history + args.n_waypoints + 1:
@@ -127,11 +161,20 @@ def main():
         instruction = ep_meta.get("instruction", "follow the person")
         fps = ep_meta.get("fps", 10)
 
+        episode_samples = 0
+        skipped_bad_meta = 0
         for t in range(args.history, len(frames) - args.n_waypoints):
-            current = str(frames[t])
-            images = [str(frames[max(0, t - args.history + i)]) for i in range(args.history)]
+            current_path = frames[t].resolve() if args.absolute_paths else frames[t]
+            current = str(current_path)
+            images = []
+            for i in range(args.history):
+                img_path = frames[max(0, t - args.history + i)]
+                images.append(str(img_path.resolve() if args.absolute_paths else img_path))
             frame_idx = int(frames[t].stem.split("_")[-1])
             meta = load_meta(ep_dir, frame_idx)
+            if meta is None:
+                skipped_bad_meta += 1
+                continue
 
             # Detect target in current frame for polar labels
             frame = cv2.imread(current)
@@ -149,6 +192,9 @@ def main():
                 invalid = 1.0
 
             waypoints, actions = integrate_waypoints(ep_dir, frame_idx, args.n_waypoints, fps)
+            if waypoints is None:
+                skipped_bad_meta += 1
+                continue
 
             sample = {
                 "episode": ep_dir.name,
@@ -168,8 +214,12 @@ def main():
                 sample["bbox"] = [cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2]
 
             all_samples.append(sample)
+            episode_samples += 1
 
-        print(f"  {ep_dir.name}: {len(frames)} frames → {len(all_samples)} samples total")
+        print(
+            f"  {ep_dir.name}: {len(frames)} frames -> {episode_samples} samples "
+            f"({skipped_bad_meta} skipped), {len(all_samples)} samples total"
+        )
 
     # Write JSONL
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)

@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 data/
+数据集/
 ckpts*/
 *.pt
 *.pth
