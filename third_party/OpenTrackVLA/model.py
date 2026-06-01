@@ -17,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from transformers import AutoTokenizer, AutoModel
 from cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens, adapt_siglip_grid
+from local_weights import default_qwen_candidates, resolve_local_model_path
 
 
 # ----------------------- utils -----------------------
@@ -192,9 +193,21 @@ class OpenTrackVLA(nn.Module):
     def __init__(self, cfg: ModelConfig, vision_feat_dim: int):
         super().__init__()
         self.cfg = cfg
-        self.llm = AutoModel.from_pretrained(cfg.llm_name, torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None)
+        llm_path = resolve_local_model_path(
+            label="Qwen/Qwen3-0.6B",
+            repo_id="Qwen/Qwen3-0.6B",
+            explicit=cfg.llm_name,
+            env_var="QWEN_MODEL_PATH",
+            candidates=default_qwen_candidates(),
+        )
+        self.cfg.llm_name = llm_path
+        self.llm = AutoModel.from_pretrained(
+            llm_path,
+            torch_dtype=torch.bfloat16 if torch.cuda.is_available() else None,
+            local_files_only=True,
+        )
         self.llm.requires_grad_(not cfg.freeze_llm)
-        self.tokenizer = AutoTokenizer.from_pretrained(cfg.llm_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(llm_path, local_files_only=True)
         self.D = self.llm.config.hidden_size
         self.proj = CrossModalityProjector(vision_feat_dim, self.D)
         self.proj.requires_grad_(True)

@@ -15,6 +15,12 @@ from transformers import AutoImageProcessor, AutoModel
 from transformers import SiglipVisionModel, SiglipImageProcessor
 from PIL import Image
 
+from local_weights import (
+    default_dinov3_candidates,
+    default_siglip_candidates,
+    resolve_local_model_path,
+)
+
 def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
@@ -218,23 +224,20 @@ class VisionCacheConfig:
     force_square_resize: bool = True    # ensure exact 384x384
 
     def __post_init__(self):
-        # Prefer explicit local DINOv3 path for official reproduction. Use
-        # DINO_MODEL_NAME only as an explicit debug override.
-        if self.dino_model_name is None:
-            env_model = os.getenv("DINO_MODEL_NAME", "").strip()
-            env_path = os.getenv("DINOV3_MODEL_PATH", "").strip()
-            if env_path and os.path.exists(env_path):
-                self.dino_model_name = env_path
-            elif env_model:
-                self.dino_model_name = env_model
-            else:
-                self.dino_model_name = "facebook/dinov3-vits16-pretrain-lvd1689m"
-        siglip_path = os.getenv("SIGLIP_MODEL_PATH", "").strip()
-        siglip_model = os.getenv("SIGLIP_MODEL_NAME", "").strip()
-        if siglip_path and os.path.exists(siglip_path):
-            self.siglip_model_name = siglip_path
-        elif siglip_model:
-            self.siglip_model_name = siglip_model
+        self.dino_model_name = resolve_local_model_path(
+            label="DINOv3",
+            repo_id="facebook/dinov3-vits16-pretrain-lvd1689m",
+            explicit=self.dino_model_name or os.getenv("DINO_MODEL_NAME", "").strip(),
+            env_var="DINOV3_MODEL_PATH",
+            candidates=default_dinov3_candidates(),
+        )
+        self.siglip_model_name = resolve_local_model_path(
+            label="SigLIP",
+            repo_id="google/siglip-so400m-patch14-384",
+            explicit=self.siglip_model_name if os.path.exists(str(self.siglip_model_name)) else None,
+            env_var="SIGLIP_MODEL_PATH",
+            candidates=default_siglip_candidates(),
+        )
 
 
 class VisionFeatureCacher(nn.Module):
@@ -243,16 +246,16 @@ class VisionFeatureCacher(nn.Module):
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         # DINOv3
-        self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name)
-        self.dino = AutoModel.from_pretrained(cfg.dino_model_name)
+        self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name, local_files_only=True)
+        self.dino = AutoModel.from_pretrained(cfg.dino_model_name, local_files_only=True)
         self.dino.eval().to(self.device)
         self.dino_patch = getattr(self.dino.config, 'patch_size', None)
         # Default to 0 registers when field is missing
         self.dino_regs = int(getattr(self.dino.config, 'num_register_tokens', 0) or 0)
         self.dino_hidden = getattr(self.dino.config, 'hidden_size', 384)
         # SigLIP (vision)
-        self.siglip_proc = SiglipImageProcessor.from_pretrained(cfg.siglip_model_name)
-        self.siglip = SiglipVisionModel.from_pretrained(cfg.siglip_model_name)
+        self.siglip_proc = SiglipImageProcessor.from_pretrained(cfg.siglip_model_name, local_files_only=True)
+        self.siglip = SiglipVisionModel.from_pretrained(cfg.siglip_model_name, local_files_only=True)
         self.siglip.eval().to(self.device)
         self.siglip_hidden = getattr(self.siglip.config, 'hidden_size', 1152)
 

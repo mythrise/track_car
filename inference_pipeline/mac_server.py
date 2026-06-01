@@ -59,34 +59,34 @@ def default_existing_path(*paths):
 
 
 def configure_default_weight_paths(args, opentrackvla_root):
-    if args.qwen_model_path:
-        os.environ["QWEN_MODEL_PATH"] = str(Path(args.qwen_model_path).expanduser().resolve())
-    else:
-        qwen_path = default_existing_path(
-            opentrackvla_root / "ckpts_hf" / "qwen3-0.6b",
-            opentrackvla_root / "ckpts_hf" / "Qwen3-0.6B",
-        )
-        if qwen_path:
-            os.environ.setdefault("QWEN_MODEL_PATH", qwen_path)
+    from local_weights import (
+        default_dinov3_candidates,
+        default_qwen_candidates,
+        default_siglip_candidates,
+        resolve_local_model_path,
+    )
 
-    if args.siglip_model_path:
-        os.environ["SIGLIP_MODEL_PATH"] = str(Path(args.siglip_model_path).expanduser().resolve())
-    else:
-        siglip_path = default_existing_path(
-            opentrackvla_root / "ckpts_hf" / "siglip-so400m-patch14-384",
-        )
-        if siglip_path:
-            os.environ.setdefault("SIGLIP_MODEL_PATH", siglip_path)
-
-    if args.dinov3_model_path:
-        os.environ["DINOV3_MODEL_PATH"] = str(Path(args.dinov3_model_path).expanduser().resolve())
-    else:
-        dinov3_path = default_existing_path(
-            PROJECT_ROOT / "weights" / "modelscope" / "dinov3-vits16-pretrain-lvd1689m",
-            opentrackvla_root / "ckpts_hf" / "dinov3-vits16-pretrain-lvd1689m",
-        )
-        if dinov3_path:
-            os.environ.setdefault("DINOV3_MODEL_PATH", dinov3_path)
+    os.environ["QWEN_MODEL_PATH"] = resolve_local_model_path(
+        label="Qwen/Qwen3-0.6B",
+        repo_id="Qwen/Qwen3-0.6B",
+        explicit=args.qwen_model_path,
+        env_var="QWEN_MODEL_PATH",
+        candidates=default_qwen_candidates(),
+    )
+    os.environ["SIGLIP_MODEL_PATH"] = resolve_local_model_path(
+        label="SigLIP",
+        repo_id="google/siglip-so400m-patch14-384",
+        explicit=args.siglip_model_path,
+        env_var="SIGLIP_MODEL_PATH",
+        candidates=default_siglip_candidates(),
+    )
+    os.environ["DINOV3_MODEL_PATH"] = resolve_local_model_path(
+        label="DINOv3",
+        repo_id="facebook/dinov3-vits16-pretrain-lvd1689m",
+        explicit=args.dinov3_model_path,
+        env_var="DINOV3_MODEL_PATH",
+        candidates=default_dinov3_candidates(),
+    )
 
     if args.base_hf_model_dir is None:
         args.base_hf_model_dir = default_existing_path(
@@ -109,7 +109,7 @@ def load_official_base(base_hf_model_dir):
     from open_trackvla_hf import OpenTrackVLAConfig, OpenTrackVLAForWaypoint
 
     base_hf_dir = Path(base_hf_model_dir).expanduser().resolve()
-    hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir))
+    hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir), local_files_only=True)
     qwen_model_path = os.environ.get("QWEN_MODEL_PATH", "").strip()
     if qwen_model_path:
         hf_config.llm_name = qwen_model_path
@@ -295,6 +295,9 @@ def handle_connection(conn, addr, args, model, encoder, device):
 
 
 def main():
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default=None)
     ap.add_argument("--port", type=int, default=9999)
@@ -343,8 +346,8 @@ def main():
         print(f"[server] base_hf_model_dir: {args.base_hf_model_dir or '(not set)'}")
         print(f"[server] pfem_ckpt: {args.ckpt or '(not set)'}")
         print(f"[server] DINOV3_MODEL_PATH: {os.environ.get('DINOV3_MODEL_PATH', '(not set)')}")
-        print(f"[server] QWEN_MODEL_PATH: {os.environ.get('QWEN_MODEL_PATH', '(HF cache / online)')}")
-        print(f"[server] SIGLIP_MODEL_PATH: {os.environ.get('SIGLIP_MODEL_PATH', '(HF cache / online)')}")
+        print(f"[server] QWEN_MODEL_PATH: {os.environ.get('QWEN_MODEL_PATH', '(not set)')}")
+        print(f"[server] SIGLIP_MODEL_PATH: {os.environ.get('SIGLIP_MODEL_PATH', '(not set)')}")
         model = load_model(args.ckpt, device, opentrackvla_root, base_hf_model_dir=args.base_hf_model_dir)
         encoder_device = "cuda" if device.type == "cuda" else "cpu"
         encoder = VisionFeatureCacher(VisionCacheConfig(image_size=384, batch_size=1, device=encoder_device))

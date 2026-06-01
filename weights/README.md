@@ -108,7 +108,11 @@ hf download omlab/opentrackvla-qwen06b \
   --local-dir third_party/OpenTrackVLA/ckpts_hf/opentrackvla-qwen06b
 ```
 
-Qwen and SigLIP, if you want local offline directories instead of HF cache:
+Qwen and SigLIP must be available locally. The code runs in offline mode and
+will not try to download from Hugging Face at runtime. Either put normal model
+directories here, or copy Hugging Face cache folders with `snapshots/<hash>/`.
+
+Normal local directories:
 
 ```bash
 hf download Qwen/Qwen3-0.6B \
@@ -116,6 +120,13 @@ hf download Qwen/Qwen3-0.6B \
 
 hf download google/siglip-so400m-patch14-384 \
   --local-dir third_party/OpenTrackVLA/ckpts_hf/siglip-so400m-patch14-384
+```
+
+Copied cache folders are also accepted:
+
+```text
+third_party/OpenTrackVLA/ckpts_hf/models--Qwen--Qwen3-0.6B/snapshots/<hash>/config.json
+third_party/OpenTrackVLA/ckpts_hf/models--google--siglip-so400m-patch14-384/snapshots/<hash>/config.json
 ```
 
 DINOv3 from ModelScope:

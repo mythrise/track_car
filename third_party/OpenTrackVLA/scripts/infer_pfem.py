@@ -23,6 +23,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from model import OpenTrackVLA, ModelConfig
 from harness.harness_wrapper import PFEMHarness
 from cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens
+from local_weights import (
+    default_dinov3_candidates,
+    default_qwen_candidates,
+    default_siglip_candidates,
+    resolve_local_model_path,
+)
 
 
 def get_default_device():
@@ -37,10 +43,8 @@ def load_official_base(base_hf_model_dir):
     from open_trackvla_hf import OpenTrackVLAConfig, OpenTrackVLAForWaypoint
 
     base_hf_dir = Path(base_hf_model_dir)
-    hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir))
-    qwen_model_path = os.environ.get("QWEN_MODEL_PATH", "").strip()
-    if qwen_model_path:
-        hf_config.llm_name = qwen_model_path
+    hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir), local_files_only=True)
+    hf_config.llm_name = os.environ["QWEN_MODEL_PATH"]
     hf_model = OpenTrackVLAForWaypoint(hf_config)
     state_path = base_hf_dir / "model.safetensors"
     if not state_path.exists():
@@ -55,7 +59,7 @@ def load_model(ckpt_path, device, base_hf_model_dir=None):
         base = load_official_base(base_hf_model_dir)
     else:
         mcfg = ModelConfig(
-            llm_name=os.environ.get("QWEN_MODEL_PATH", "Qwen/Qwen3-0.6B"),
+            llm_name=os.environ["QWEN_MODEL_PATH"],
             n_waypoints=8,
             freeze_llm=True,
         )
@@ -80,6 +84,9 @@ def encode_frame(encoder, img_pil):
 
 
 def main():
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--ckpt", default=None)
@@ -92,12 +99,27 @@ def main():
     ap.add_argument("--siglip_model_path", default=None)
     args = ap.parse_args()
 
-    if args.qwen_model_path:
-        os.environ["QWEN_MODEL_PATH"] = args.qwen_model_path
-    if args.dinov3_model_path:
-        os.environ["DINOV3_MODEL_PATH"] = args.dinov3_model_path
-    if args.siglip_model_path:
-        os.environ["SIGLIP_MODEL_PATH"] = args.siglip_model_path
+    os.environ["QWEN_MODEL_PATH"] = resolve_local_model_path(
+        label="Qwen/Qwen3-0.6B",
+        repo_id="Qwen/Qwen3-0.6B",
+        explicit=args.qwen_model_path,
+        env_var="QWEN_MODEL_PATH",
+        candidates=default_qwen_candidates(),
+    )
+    os.environ["DINOV3_MODEL_PATH"] = resolve_local_model_path(
+        label="DINOv3",
+        repo_id="facebook/dinov3-vits16-pretrain-lvd1689m",
+        explicit=args.dinov3_model_path,
+        env_var="DINOV3_MODEL_PATH",
+        candidates=default_dinov3_candidates(),
+    )
+    os.environ["SIGLIP_MODEL_PATH"] = resolve_local_model_path(
+        label="SigLIP",
+        repo_id="google/siglip-so400m-patch14-384",
+        explicit=args.siglip_model_path,
+        env_var="SIGLIP_MODEL_PATH",
+        candidates=default_siglip_candidates(),
+    )
 
     device = torch.device(get_default_device())
     print(f"[infer] device={device}")

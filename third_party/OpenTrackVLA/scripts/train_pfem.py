@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from model import OpenTrackVLA, ModelConfig, JsonTrackingDataset, DataConfig, collate_batch
 from harness.harness_wrapper import PFEMHarness
+from local_weights import default_qwen_candidates, resolve_local_model_path
 
 
 def parse_args():
@@ -53,8 +54,15 @@ def parse_args():
 
 def main():
     args = parse_args()
-    if args.qwen_model_path:
-        os.environ["QWEN_MODEL_PATH"] = args.qwen_model_path
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ["QWEN_MODEL_PATH"] = resolve_local_model_path(
+        label="Qwen/Qwen3-0.6B",
+        repo_id="Qwen/Qwen3-0.6B",
+        explicit=args.qwen_model_path,
+        env_var="QWEN_MODEL_PATH",
+        candidates=default_qwen_candidates(),
+    )
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
     print(f"[train_pfem] device={device}")
 
@@ -65,10 +73,8 @@ def main():
 
         print(f"[train_pfem] loading base HF checkpoint: {args.base_hf_model_dir}")
         base_hf_dir = Path(args.base_hf_model_dir)
-        hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir))
-        qwen_model_path = os.environ.get("QWEN_MODEL_PATH", "").strip()
-        if qwen_model_path:
-            hf_config.llm_name = qwen_model_path
+        hf_config = OpenTrackVLAConfig.from_pretrained(str(base_hf_dir), local_files_only=True)
+        hf_config.llm_name = os.environ["QWEN_MODEL_PATH"]
         hf_model = OpenTrackVLAForWaypoint(hf_config)
         state_path = base_hf_dir / "model.safetensors"
         if not state_path.exists():
@@ -83,7 +89,7 @@ def main():
         print(f"[train_pfem] loaded official base planner, n_waypoints={args.n_waypoints}")
     else:
         mcfg = ModelConfig(
-            llm_name=os.environ.get("QWEN_MODEL_PATH", "Qwen/Qwen3-0.6B"),
+            llm_name=os.environ["QWEN_MODEL_PATH"],
             n_waypoints=args.n_waypoints,
             freeze_llm=True,
         )

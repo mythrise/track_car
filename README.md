@@ -53,6 +53,9 @@ Required assets:
 
 See `weights/README.md` for copy/download commands.
 
+Runtime model loading is local-only. If Qwen or SigLIP is missing locally, the
+server will fail with the checked paths instead of trying to download online.
+
 ## Install
 
 ```bash
