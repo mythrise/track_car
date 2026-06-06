@@ -12,18 +12,14 @@ import sys
 import time
 from pathlib import Path
 
-import cv2
-import numpy as np
-from PIL import Image
-
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
-    from car_hardware import command_from_key, waypoint_to_motor
+    from car_hardware import boosted_motors, command_from_key, motor_delta, waypoint_to_motor
     from car_protocol import recv_jpeg_frame, recv_json, send_json
     from process_cleanup import cleanup_port
 except ImportError:
-    from car_runtime.car_hardware import command_from_key, waypoint_to_motor
+    from car_runtime.car_hardware import boosted_motors, command_from_key, motor_delta, waypoint_to_motor
     from car_runtime.car_protocol import recv_jpeg_frame, recv_json, send_json
     from car_runtime.process_cleanup import cleanup_port
 
@@ -151,6 +147,8 @@ def load_model(ckpt_path, device, opentrackvla_root, base_hf_model_dir=None):
 
 def encode_frame(frame, encoder):
     import torch
+    import cv2
+    from PIL import Image
     from cache_gridpool import grid_pool_tokens
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -195,6 +193,45 @@ MOCK_KEYS = {
 }
 
 
+def clamp_float(value, min_value, max_value):
+    value = float(value)
+    if value != value or value in (float("inf"), float("-inf")):
+        return 0.0
+    return max(min_value, min(max_value, value))
+
+
+def waypoint_to_action_command(waypoints, args):
+    n_waypoints = int(waypoints.shape[0])
+    if n_waypoints <= 0:
+        raise RuntimeError("model returned no waypoints")
+    idx = max(0, min(int(args.control_waypoint_index), n_waypoints - 1))
+    horizon = (idx + 1) * float(args.control_dt)
+    if horizon <= 0:
+        raise ValueError("--control_dt must be > 0")
+
+    selected_wp = waypoints[idx].detach().float().cpu().tolist()
+    raw_action = [float(value) / horizon for value in selected_wp[:3]]
+    max_abs = float(args.max_action_abs)
+    action = [clamp_float(value, -max_abs, max_abs) for value in raw_action]
+
+    motors = waypoint_to_motor(action, scale=float(args.motor_scale))
+    if args.min_motor_delta > 0:
+        motors = boosted_motors(motors, args.min_motor_delta)
+
+    debug = {
+        "control_waypoint_index": idx,
+        "control_dt": float(args.control_dt),
+        "control_horizon": horizon,
+        "raw_waypoint": selected_wp,
+        "raw_action": raw_action,
+        "action": action,
+        "motor_scale": float(args.motor_scale),
+        "min_motor_delta": int(args.min_motor_delta),
+        "motor_delta": motor_delta(motors),
+    }
+    return motors, debug
+
+
 def default_device():
     try:
         import torch
@@ -236,6 +273,13 @@ def handle_connection(conn, addr, args, model, encoder, device):
                 motors = mock.motors
                 confidence = 1.0
                 mode = 0
+                debug = {
+                    "mock_control": True,
+                    "mock_action": args.mock_action,
+                    "mock_speed": args.mock_speed,
+                    "action": mock.action,
+                    "motor_delta": motor_delta(motors),
+                }
             else:
                 import torch
 
@@ -257,8 +301,7 @@ def handle_connection(conn, addr, args, model, encoder, device):
                 state = out["new_state"]
                 wp = out["waypoints"][0]  # (8, 3)
 
-                # Use waypoint[1] for motor command (same as trained_agent.py)
-                motors = waypoint_to_motor(wp[1].detach().cpu().tolist())
+                motors, debug = waypoint_to_action_command(wp, args)
 
                 # Use Polar-CoT for pan-tilt
                 cot_theta = out["cot_decoded"]["theta_deg"][0].item()
@@ -279,11 +322,12 @@ def handle_connection(conn, addr, args, model, encoder, device):
                 "confidence": confidence,
                 "mode": mode,
                 "stop": args.mock_control and args.mock_action == "stop",
+                "debug": debug,
             })
 
             if frame_count % 30 == 0:
                 print(f"  frame={frame_count} dt={dt*1000:.0f}ms fps={1/max(dt,0.001):.1f} "
-                      f"C={confidence:.2f} mode={mode}")
+                      f"C={confidence:.2f} mode={mode} motor_delta={debug['motor_delta']}")
 
     except socket.timeout:
         print("[server] socket timeout")
@@ -317,12 +361,33 @@ def main():
                     help="Do not load the model; return a fixed safe command for protocol testing.")
     ap.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
     ap.add_argument("--mock_speed", type=int, default=200)
+    ap.add_argument("--control_dt", type=float, default=0.1,
+                    help="Seconds between trained waypoints; used to convert waypoint displacement to action.")
+    ap.add_argument("--control_waypoint_index", type=int, default=1,
+                    help="Future waypoint index used for motor control. action = waypoint / ((index + 1) * dt).")
+    ap.add_argument("--motor_scale", type=float, default=400.0,
+                    help="PWM speed scale passed to waypoint_to_motor after waypoint-to-action conversion.")
+    ap.add_argument("--min_motor_delta", type=int, default=0,
+                    help="Optional minimum PWM delta from neutral for nonzero motor commands.")
+    ap.add_argument("--max_action_abs", type=float, default=1.0,
+                    help="Clamp each normalized action component to +/- this value before motor conversion.")
     ap.add_argument("--timeout", type=float, default=2.0)
     ap.add_argument("--no_cleanup_port", action="store_true",
                     help="Do not kill an existing process listening on --port before startup.")
     ap.add_argument("--cleanup_dry_run", action="store_true",
                     help="Print cleanup targets without killing them.")
     args = ap.parse_args()
+
+    if args.control_dt <= 0:
+        ap.error("--control_dt must be > 0")
+    if args.control_waypoint_index < 0:
+        ap.error("--control_waypoint_index must be >= 0")
+    if args.motor_scale <= 0:
+        ap.error("--motor_scale must be > 0")
+    if args.min_motor_delta < 0:
+        ap.error("--min_motor_delta must be >= 0")
+    if args.max_action_abs <= 0:
+        ap.error("--max_action_abs must be > 0")
 
     if not args.no_cleanup_port:
         cleanup_port(args.port, dry_run=args.cleanup_dry_run)
