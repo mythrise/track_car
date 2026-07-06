@@ -73,7 +73,9 @@ def main():
         print(f"[move_test] kick_speed={kick_speed} kick_duration={args.kick_duration:.3f}s "
               f"kick_motors={kick_motors}")
     try:
-        hardware.run_motors_with_kick(cmd.motors, kick_motors, args.kick_duration)
+        sent_motors = hardware.run_motors_with_kick(cmd.motors, kick_motors, args.kick_duration)
+        if sent_motors != cmd.motors:
+            print(f"[move_test] wheel trim active: motors actually sent={sent_motors}")
         time.sleep(duration)
     finally:
         hardware.close()

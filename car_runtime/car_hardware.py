@@ -8,6 +8,7 @@ API used by data collection and deployment scripts.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import time
 from typing import List, Sequence
 
@@ -15,6 +16,17 @@ try:
     from uart_transport import UartTransport
 except ImportError:
     from car_runtime.uart_transport import UartTransport
+
+try:
+    from wheel_trim import DEFAULT_TRIM_PATH, apply_trim, default_trim, load_trim, sanitize_trim
+except ImportError:
+    from car_runtime.wheel_trim import (
+        DEFAULT_TRIM_PATH,
+        apply_trim,
+        default_trim,
+        load_trim,
+        sanitize_trim,
+    )
 
 try:
     import pigpio  # type: ignore
@@ -259,11 +271,17 @@ class CarHardware:
         uart_port: str | None = None,
         reset_servos: bool = False,
         dry_run: bool | None = None,
+        trim: dict | None = None,
+        trim_path: str | Path | None = None,
     ):
         self.dry_run = False if dry_run is None else dry_run
         self.uart = UartTransport(baud=baud, port=uart_port, dry_run=self.dry_run)
         self.pi = None
         self._servo_warning_printed = False
+        self.trim_path = trim_path if trim_path is not None else DEFAULT_TRIM_PATH
+        self.trim = sanitize_trim(trim) if trim is not None else load_trim(self.trim_path)
+        if self.trim != default_trim():
+            print(f"[car_hardware] wheel trim active: {self.trim} (from {self.trim_path})")
         if self.dry_run:
             print("[car_hardware] dry-run mode: hardware output disabled")
         else:
@@ -283,9 +301,19 @@ class CarHardware:
     def send_uart(self, command: str) -> None:
         self.uart.send_str(command)
 
-    def run_raw(self, l1: int, r1: int, l2: int, r2: int) -> None:
-        """Run raw PWM pulses on the four motor channels."""
-        self.send_uart(format_motor_command(l1, r1, l2, r2))
+    def set_trim(self, trim: dict) -> None:
+        """Override the active per-wheel trim in memory (does not touch the trim file)."""
+        self.trim = sanitize_trim(trim)
+
+    def reload_trim(self) -> None:
+        """Reload per-wheel trim from `self.trim_path`, discarding any in-memory override."""
+        self.trim = load_trim(self.trim_path)
+
+    def run_raw(self, l1: int, r1: int, l2: int, r2: int) -> List[int]:
+        """Run raw PWM pulses on the four motor channels, corrected by wheel trim."""
+        motors = apply_trim([l1, r1, l2, r2], trim=self.trim, base=NEUTRAL)
+        self.send_uart(format_motor_command(*motors))
+        return motors
 
     def run_speeds(
         self,
@@ -296,31 +324,38 @@ class CarHardware:
         time_ms: int = 0,
     ) -> List[int]:
         """Run verified MotionControl wheel speeds and return the PWM pulses sent."""
-        motors = speed_to_pwm(speed_l1, speed_r1, speed_l2, speed_r2)
-        self.send_uart(build_motor_command(speed_l1, speed_r1, speed_l2, speed_r2, time_ms=time_ms))
+        motors = apply_trim(
+            speed_to_pwm(speed_l1, speed_r1, speed_l2, speed_r2),
+            trim=self.trim,
+            base=NEUTRAL,
+        )
+        self.send_uart(format_motor_command(*motors, time_ms=time_ms))
         return motors
 
-    def run_motors(self, motors: Sequence[int]) -> None:
-        self.run_raw(*[int(v) for v in motors])
+    def run_motors(self, motors: Sequence[int]) -> List[int]:
+        """Send a 4-pulse PWM command and return the trimmed pulses actually sent."""
+        return self.run_raw(*[int(v) for v in motors])
 
     def run_motors_with_kick(
         self,
         steady_motors: Sequence[int],
         kick_motors: Sequence[int],
         kick_duration: float,
-    ) -> None:
+    ) -> List[int]:
+        """Run an optional kick pulse then the steady command; returns the
+        trimmed steady pulses actually sent (the command now in effect)."""
         kick_duration = max(0.0, min(float(kick_duration), 0.25))
         steady = [clamp_pulse(v) for v in steady_motors]
         kick = [clamp_pulse(v) for v in kick_motors]
         if kick_duration > 0 and motor_delta(steady) > 0 and kick != steady:
             self.run_motors(kick)
             time.sleep(kick_duration)
-        self.run_motors(steady)
+        return self.run_motors(steady)
 
     def run_action(self, action: Sequence[float], scale: float = 300.0) -> List[int]:
+        """Convert a normalized action to motor pulses and return the trimmed pulses sent."""
         motors = waypoint_to_motor(action, scale=scale)
-        self.run_motors(motors)
-        return motors
+        return self.run_motors(motors)
 
     def move_forward(self, speed: int = DEFAULT_BASE_SPEED, time_ms: int = 0) -> List[int]:
         speed = abs(clamp_speed(speed))

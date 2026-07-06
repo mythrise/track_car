@@ -90,7 +90,9 @@ def main() -> None:
             if args.confirm_each and not confirm(f"Run speed {speed}?"):
                 continue
 
-            hardware.run_motors_with_kick(cmd.motors, kick_motors, kick_duration)
+            sent_motors = hardware.run_motors_with_kick(cmd.motors, kick_motors, kick_duration)
+            if sent_motors != cmd.motors:
+                print(f"[speed_sweep] wheel trim active: motors actually sent={sent_motors}")
             time.sleep(duration)
             hardware.stop()
             time.sleep(pause)

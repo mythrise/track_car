@@ -21,13 +21,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
-    from car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
+    from car_hardware import MAX_SPEED, NEUTRAL, CarHardware, boosted_motors, command_from_key
     from camera_source import BACKENDS, open_camera
     from process_cleanup import cleanup_named_processes
+    from wheel_trim import apply_trim
 except ImportError:
-    from car_runtime.car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
+    from car_runtime.car_hardware import MAX_SPEED, NEUTRAL, CarHardware, boosted_motors, command_from_key
     from car_runtime.camera_source import BACKENDS, open_camera
     from car_runtime.process_cleanup import cleanup_named_processes
+    from car_runtime.wheel_trim import apply_trim
 
 
 def read_key_nonblocking():
@@ -200,6 +202,19 @@ def main():
             if not cv2.imwrite(frame_path, frame):
                 raise RuntimeError(f"Failed to write frame: {frame_path}")
 
+            # Log the trimmed pulses actually in effect on the wheels, not the
+            # pre-trim nominal command, so training metadata matches reality.
+            if hardware is not None:
+                logged_motors = apply_trim(last_cmd.motors, trim=hardware.trim, base=NEUTRAL)
+                logged_kick_motors = (
+                    apply_trim(frame_kick_motors, trim=hardware.trim, base=NEUTRAL)
+                    if frame_kick_motors is not None
+                    else None
+                )
+            else:
+                logged_motors = last_cmd.motors
+                logged_kick_motors = frame_kick_motors
+
             meta = {
                 "frame": fname,
                 "timestamp": time.time(),
@@ -208,11 +223,11 @@ def main():
                 "episode": args.episode_name,
                 "teleop": args.teleop,
                 "command": last_cmd.name,
-                "motors": last_cmd.motors,
+                "motors": logged_motors,
                 "action": last_cmd.action,
                 "speed": speed,
                 "kick_applied": frame_kick_applied,
-                "kick_motors": frame_kick_motors,
+                "kick_motors": logged_kick_motors,
             }
             with open(os.path.join(save_dir, f"meta_{frame_idx:06d}.json"), "w") as f:
                 json.dump(meta, f)
