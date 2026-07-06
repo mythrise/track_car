@@ -43,6 +43,14 @@ MIN_SPEED = -1000
 MAX_SPEED = 1000
 DEFAULT_BASE_SPEED = 400
 DEFAULT_MAX_SPEED = 900
+MAX_TRANSITION_MS = 2000
+
+# Arc-turn blend for command_from_key's a/d keys: action = [turn_forward_ratio,
+# 0, +-turn_yaw_ratio] instead of pure yaw, so the car curves while moving
+# instead of spinning in place. Keep turn_yaw_ratio <= turn_forward_ratio so
+# the inner wheel slows toward neutral but never reverses.
+DEFAULT_TURN_FORWARD_RATIO = 0.5
+DEFAULT_TURN_YAW_RATIO = 0.5
 
 MOTOR_L1_CHANNEL = 6
 MOTOR_R1_CHANNEL = 7
@@ -65,8 +73,18 @@ def angle_to_pulse(angle: float) -> int:
 
 
 def format_motor_command(l1: int, r1: int, l2: int, r2: int, time_ms: int = 0) -> str:
-    """Format the vendor serial command for four motor channels."""
-    time_ms = max(0, int(time_ms))
+    """Format the vendor serial command for four motor channels.
+
+    `time_ms` is presumed to be the vendor board's own transition time --
+    ramping each channel's PWM from its current value to the target over
+    that many milliseconds instead of snapping instantly. This is inferred
+    from `stop_command` below already using `time_ms=1000` for a graceful
+    stop, since no vendor manual ships in this repo to confirm it. Verify
+    the actual ramp behavior on the real car (lifted, at low speed) before
+    relying on it -- if it turns out to be a no-op or means something else,
+    `--smooth_ms 0` disables it everywhere it's exposed.
+    """
+    time_ms = max(0, min(MAX_TRANSITION_MS, int(time_ms)))
     return (
         f"#{MOTOR_L1_CHANNEL:03d}P{clamp_pulse(l1):04d}T{time_ms:04d}!"
         f"#{MOTOR_R1_CHANNEL:03d}P{clamp_pulse(r1):04d}T{time_ms:04d}!"
@@ -227,12 +245,21 @@ class TeleopCommand:
     action: List[float]
 
 
-def command_from_key(key: str, speed: int = 300) -> TeleopCommand:
+def command_from_key(
+    key: str,
+    speed: int = 300,
+    turn_forward_ratio: float = DEFAULT_TURN_FORWARD_RATIO,
+    turn_yaw_ratio: float = DEFAULT_TURN_YAW_RATIO,
+) -> TeleopCommand:
     """Map simple keyboard commands to motor pulses and normalized actions.
 
     Keys:
       w/s: forward/back
-      a/d: turn left/right
+      a/d: arc turn left/right -- blends forward + yaw so the car curves
+           while moving instead of spinning in place. Keep
+           turn_yaw_ratio <= turn_forward_ratio so the inner wheel slows
+           toward neutral but never reverses; raising turn_yaw_ratio above
+           turn_forward_ratio brings back some in-place spin for tighter turns.
       q/e: strafe left/right
       space/x: stop
     """
@@ -243,10 +270,10 @@ def command_from_key(key: str, speed: int = 300) -> TeleopCommand:
         action = [-1.0, 0.0, 0.0]
         name = "backward"
     elif key == "a":
-        action = [0.0, 0.0, -1.0]
+        action = [turn_forward_ratio, 0.0, -turn_yaw_ratio]
         name = "turn_left"
     elif key == "d":
-        action = [0.0, 0.0, 1.0]
+        action = [turn_forward_ratio, 0.0, turn_yaw_ratio]
         name = "turn_right"
     elif key == "q":
         action = [0.0, -1.0, 0.0]
@@ -309,10 +336,16 @@ class CarHardware:
         """Reload per-wheel trim from `self.trim_path`, discarding any in-memory override."""
         self.trim = load_trim(self.trim_path)
 
-    def run_raw(self, l1: int, r1: int, l2: int, r2: int) -> List[int]:
-        """Run raw PWM pulses on the four motor channels, corrected by wheel trim."""
+    def run_raw(self, l1: int, r1: int, l2: int, r2: int, time_ms: int = 0) -> List[int]:
+        """Run raw PWM pulses on the four motor channels, corrected by wheel trim.
+
+        `time_ms` > 0 asks the vendor board to ramp smoothly to these pulses
+        instead of snapping instantly -- use it to soften transitions between
+        different commands (see `run_motors`/`run_motors_with_kick`). See
+        `format_motor_command`'s docstring: this ramp behavior is inferred,
+        not confirmed against vendor documentation -- verify on real hardware."""
         motors = apply_trim([l1, r1, l2, r2], trim=self.trim, base=NEUTRAL)
-        self.send_uart(format_motor_command(*motors))
+        self.send_uart(format_motor_command(*motors, time_ms=time_ms))
         return motors
 
     def run_speeds(
@@ -332,25 +365,30 @@ class CarHardware:
         self.send_uart(format_motor_command(*motors, time_ms=time_ms))
         return motors
 
-    def run_motors(self, motors: Sequence[int]) -> List[int]:
+    def run_motors(self, motors: Sequence[int], time_ms: int = 0) -> List[int]:
         """Send a 4-pulse PWM command and return the trimmed pulses actually sent."""
-        return self.run_raw(*[int(v) for v in motors])
+        return self.run_raw(*[int(v) for v in motors], time_ms=time_ms)
 
     def run_motors_with_kick(
         self,
         steady_motors: Sequence[int],
         kick_motors: Sequence[int],
         kick_duration: float,
+        steady_time_ms: int = 0,
     ) -> List[int]:
         """Run an optional kick pulse then the steady command; returns the
-        trimmed steady pulses actually sent (the command now in effect)."""
+        trimmed steady pulses actually sent (the command now in effect).
+
+        The kick itself always snaps instantly (it is a brief, deliberate
+        overshoot to beat static friction); `steady_time_ms` only smooths the
+        transition into the steady command that follows it."""
         kick_duration = max(0.0, min(float(kick_duration), 0.25))
         steady = [clamp_pulse(v) for v in steady_motors]
         kick = [clamp_pulse(v) for v in kick_motors]
         if kick_duration > 0 and motor_delta(steady) > 0 and kick != steady:
             self.run_motors(kick)
             time.sleep(kick_duration)
-        return self.run_motors(steady)
+        return self.run_motors(steady, time_ms=steady_time_ms)
 
     def run_action(self, action: Sequence[float], scale: float = 300.0) -> List[int]:
         """Convert a normalized action to motor pulses and return the trimmed pulses sent."""

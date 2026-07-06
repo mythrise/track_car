@@ -11,10 +11,26 @@ import argparse
 import time
 
 try:
-    from car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
+    from car_hardware import (
+        DEFAULT_TURN_FORWARD_RATIO,
+        DEFAULT_TURN_YAW_RATIO,
+        MAX_SPEED,
+        MAX_TRANSITION_MS,
+        CarHardware,
+        boosted_motors,
+        command_from_key,
+    )
     from process_cleanup import cleanup_named_processes
 except ImportError:
-    from car_runtime.car_hardware import MAX_SPEED, CarHardware, boosted_motors, command_from_key
+    from car_runtime.car_hardware import (
+        DEFAULT_TURN_FORWARD_RATIO,
+        DEFAULT_TURN_YAW_RATIO,
+        MAX_SPEED,
+        MAX_TRANSITION_MS,
+        CarHardware,
+        boosted_motors,
+        command_from_key,
+    )
     from car_runtime.process_cleanup import cleanup_named_processes
 
 
@@ -46,6 +62,14 @@ def main():
                     help="Optional short startup kick wheel speed. Use 0 to disable.")
     ap.add_argument("--kick_duration", type=float, default=0.06,
                     help="Kick duration in seconds, clamped to 0.25.")
+    ap.add_argument("--smooth_ms", type=int, default=200,
+                    help="Vendor-board transition time in ms for the steady command, "
+                         "so speed changes ramp smoothly instead of snapping. 0 disables.")
+    ap.add_argument("--turn_forward_ratio", type=float, default=DEFAULT_TURN_FORWARD_RATIO,
+                    help="Forward-speed fraction blended into left/right turns (arc turn).")
+    ap.add_argument("--turn_yaw_ratio", type=float, default=DEFAULT_TURN_YAW_RATIO,
+                    help="Yaw fraction used for left/right turns. Keep <= turn_forward_ratio "
+                         "so the inner wheel never reverses (no in-place spin).")
     ap.add_argument("--no_cleanup_processes", action="store_true",
                     help="Do not kill vendor camera/main processes before motor test.")
     ap.add_argument("--cleanup_dry_run", action="store_true",
@@ -60,7 +84,13 @@ def main():
     duration = max(0.05, min(args.duration, 3.0))
     speed = max(0, min(args.speed, MAX_SPEED))
     kick_speed = max(0, min(args.kick_speed, MAX_SPEED))
-    cmd = command_from_key(KEY_BY_MOVE[args.move], speed)
+    smooth_ms = max(0, min(MAX_TRANSITION_MS, args.smooth_ms))
+    cmd = command_from_key(
+        KEY_BY_MOVE[args.move],
+        speed,
+        turn_forward_ratio=args.turn_forward_ratio,
+        turn_yaw_ratio=args.turn_yaw_ratio,
+    )
     kick_motors = boosted_motors(cmd.motors, kick_speed) if kick_speed else cmd.motors
     hardware = CarHardware(
         uart_port=args.uart_port,
@@ -68,12 +98,15 @@ def main():
         dry_run=not args.execute,
     )
 
-    print(f"[move_test] move={cmd.name} speed={speed} duration={duration:.2f}s motors={cmd.motors}")
+    print(f"[move_test] move={cmd.name} speed={speed} duration={duration:.2f}s "
+          f"smooth_ms={smooth_ms} motors={cmd.motors}")
     if kick_speed and cmd.name != "stop":
         print(f"[move_test] kick_speed={kick_speed} kick_duration={args.kick_duration:.3f}s "
               f"kick_motors={kick_motors}")
     try:
-        sent_motors = hardware.run_motors_with_kick(cmd.motors, kick_motors, args.kick_duration)
+        sent_motors = hardware.run_motors_with_kick(
+            cmd.motors, kick_motors, args.kick_duration, steady_time_ms=smooth_ms
+        )
         if sent_motors != cmd.motors:
             print(f"[move_test] wheel trim active: motors actually sent={sent_motors}")
         time.sleep(duration)

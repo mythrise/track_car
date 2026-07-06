@@ -21,12 +21,30 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
 try:
-    from car_hardware import MAX_SPEED, NEUTRAL, CarHardware, boosted_motors, command_from_key
+    from car_hardware import (
+        DEFAULT_TURN_FORWARD_RATIO,
+        DEFAULT_TURN_YAW_RATIO,
+        MAX_SPEED,
+        MAX_TRANSITION_MS,
+        NEUTRAL,
+        CarHardware,
+        boosted_motors,
+        command_from_key,
+    )
     from camera_source import BACKENDS, open_camera
     from process_cleanup import cleanup_named_processes
     from wheel_trim import apply_trim
 except ImportError:
-    from car_runtime.car_hardware import MAX_SPEED, NEUTRAL, CarHardware, boosted_motors, command_from_key
+    from car_runtime.car_hardware import (
+        DEFAULT_TURN_FORWARD_RATIO,
+        DEFAULT_TURN_YAW_RATIO,
+        MAX_SPEED,
+        MAX_TRANSITION_MS,
+        NEUTRAL,
+        CarHardware,
+        boosted_motors,
+        command_from_key,
+    )
     from car_runtime.camera_source import BACKENDS, open_camera
     from car_runtime.process_cleanup import cleanup_named_processes
     from car_runtime.wheel_trim import apply_trim
@@ -55,13 +73,18 @@ def apply_keyboard_command(
     kick_duration,
     kick_repeat,
     last_kick_time,
+    smooth_ms=0,
+    turn_forward_ratio=DEFAULT_TURN_FORWARD_RATIO,
+    turn_yaw_ratio=DEFAULT_TURN_YAW_RATIO,
 ):
     """Apply one keyboard event using the same motor path as move_test.py."""
     if key is None:
         return last_cmd, last_kick_time, False, None
 
     now = time.time()
-    next_cmd = command_from_key(key, speed)
+    next_cmd = command_from_key(
+        key, speed, turn_forward_ratio=turn_forward_ratio, turn_yaw_ratio=turn_yaw_ratio
+    )
     kick_speed = clamp_nonnegative(kick_speed, MAX_SPEED)
     kick_duration = max(0.0, min(float(kick_duration), 0.25))
     command_changed = next_cmd.name != last_cmd.name
@@ -75,10 +98,10 @@ def apply_keyboard_command(
 
     if should_kick:
         kick_motors = boosted_motors(next_cmd.motors, kick_speed)
-        hardware.run_motors_with_kick(next_cmd.motors, kick_motors, kick_duration)
+        hardware.run_motors_with_kick(next_cmd.motors, kick_motors, kick_duration, steady_time_ms=smooth_ms)
         return next_cmd, now, True, kick_motors
 
-    hardware.run_motors(next_cmd.motors)
+    hardware.run_motors(next_cmd.motors, time_ms=smooth_ms)
     return next_cmd, last_kick_time, False, None
 
 
@@ -105,6 +128,14 @@ def main():
                     help="Kick duration in seconds, clamped to 0.25.")
     ap.add_argument("--kick_repeat", type=float, default=0.75,
                     help="Minimum seconds between repeated kicks while holding the same key.")
+    ap.add_argument("--smooth_ms", type=int, default=200,
+                    help="Vendor-board transition time in ms for the steady command, "
+                         "so speed/direction changes ramp smoothly instead of snapping. 0 disables.")
+    ap.add_argument("--turn_forward_ratio", type=float, default=DEFAULT_TURN_FORWARD_RATIO,
+                    help="Forward-speed fraction blended into left/right turns (arc turn).")
+    ap.add_argument("--turn_yaw_ratio", type=float, default=DEFAULT_TURN_YAW_RATIO,
+                    help="Yaw fraction used for left/right turns. Keep <= turn_forward_ratio "
+                         "so the inner wheel never reverses (no in-place spin).")
     ap.add_argument("--max_frames", type=int, default=0,
                     help="Stop after this many saved frames. 0 means run until Ctrl+C.")
     ap.add_argument("--max_seconds", type=float, default=0.0,
@@ -130,6 +161,7 @@ def main():
     kick_speed = clamp_nonnegative(args.kick_speed, MAX_SPEED)
     kick_duration = max(0.0, min(args.kick_duration, 0.25))
     kick_repeat = max(0.0, float(args.kick_repeat))
+    smooth_ms = max(0, min(MAX_TRANSITION_MS, args.smooth_ms))
     fps = max(1, min(int(args.fps), 60))
     max_frames = max(0, int(args.max_frames))
     max_seconds = max(0.0, float(args.max_seconds))
@@ -164,7 +196,7 @@ def main():
         print(f"[collect] saving to {save_dir}, press Ctrl+C to stop")
         print(f"[collect] speed={speed} fps={fps} dry_run={args.dry_run}")
         if args.teleop == "keyboard":
-            print("[collect] keyboard teleop: w/s forward/back, a/d turn, q/e strafe, space/x stop")
+            print("[collect] keyboard teleop: w/s forward/back, a/d arc-turn left/right, q/e strafe, space/x stop")
             if sys.stdin.isatty():
                 old_term = termios.tcgetattr(sys.stdin.fileno())
                 tty.setcbreak(sys.stdin.fileno())
@@ -195,6 +227,9 @@ def main():
                     kick_duration,
                     kick_repeat,
                     last_kick_time,
+                    smooth_ms=smooth_ms,
+                    turn_forward_ratio=args.turn_forward_ratio,
+                    turn_yaw_ratio=args.turn_yaw_ratio,
                 )
 
             fname = f"frame_{frame_idx:06d}.jpg"
@@ -266,6 +301,9 @@ def main():
             "speed": speed,
             "kick_speed": kick_speed,
             "kick_duration": kick_duration,
+            "smooth_ms": smooth_ms,
+            "turn_forward_ratio": args.turn_forward_ratio,
+            "turn_yaw_ratio": args.turn_yaw_ratio,
             "kick_repeat": kick_repeat,
             "dry_run": args.dry_run,
         }

@@ -81,11 +81,20 @@ For `--speed 400`, `move_test.py` sends:
 ```text
 forward:      [1900, 1100, 1900, 1100]
 backward:     [1100, 1900, 1100, 1900]
-left turn:    [1100, 1100, 1100, 1100]
-right turn:   [1900, 1900, 1900, 1900]
+left turn:    [1500, 1100, 1500, 1100]
+right turn:   [1900, 1500, 1900, 1500]
 strafe_left:  [1100, 1100, 1900, 1900]
 strafe_right: [1900, 1900, 1100, 1100]
 ```
+
+Turns are arc turns, not in-place spins: the default
+`--turn_forward_ratio 0.5 --turn_yaw_ratio 0.5` pivots around a stationary
+inner wheel while the outer wheel drives at full commanded speed (keep
+yaw <= forward to avoid an in-place spin). `--smooth_ms` (default 200) also
+asks the vendor board to ramp into each new command instead of snapping
+instantly, softening transitions between commands -- pass `--smooth_ms 0`
+for the old instant-snap behavior. Both flags are also on `speed_sweep.py`
+and `data_pipeline/collect_data.py`.
 
 Check camera startup time:
 

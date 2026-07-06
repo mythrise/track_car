@@ -66,11 +66,30 @@ For `speed=400`, the keyboard primitives produce:
 ```text
 forward:      [1900, 1100, 1900, 1100]
 backward:     [1100, 1900, 1100, 1900]
-turn_left:    [1100, 1100, 1100, 1100]
-turn_right:   [1900, 1900, 1900, 1900]
+turn_left:    [1500, 1100, 1500, 1100]
+turn_right:   [1900, 1500, 1900, 1500]
 strafe_left:  [1100, 1100, 1900, 1900]
 strafe_right: [1900, 1900, 1100, 1100]
 ```
+
+`turn_left`/`turn_right` are arc turns, not in-place spins: with the default
+`turn_forward_ratio=0.5`/`turn_yaw_ratio=0.5` (`car_hardware.command_from_key`),
+the inner-side wheels go to neutral (pivot, never reverse) while the outer
+side drives at full commanded speed. Tune with `--turn_forward_ratio`/
+`--turn_yaw_ratio` (`move_test.py`, `speed_sweep.py`,
+`data_pipeline/collect_data.py`); keep yaw <= forward to avoid reintroducing
+in-place spin.
+
+## Transition Time (`T` field)
+
+The trailing `Txxxx` field is presumed to be the vendor board's own PWM
+ramp duration in milliseconds (ramping from the current pulse to the target
+instead of snapping) -- inferred from the stop command below already using
+`T1000` for a graceful stop, not confirmed against vendor documentation.
+`--smooth_ms` (default 200 on the same three scripts) applies this to
+regular movement/turn commands too, to soften transitions between commands;
+pass `--smooth_ms 0` to fall back to the original instant-snap behavior.
+Verify actual ramp behavior on the real car before relying on it.
 
 Stop command:
 
