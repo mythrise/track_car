@@ -30,6 +30,8 @@ from data_pipeline.target_detector import get_default_target_detector
 
 SUPPORTED_ACTION_SEMANTICS = {"spin_v1", "arc_turn_v2"}
 TURN_THRESHOLD = 0.2
+POLAR_THETA_BINS = 60
+POLAR_DISTANCE_BINS = 30
 
 
 class DataIntegrityError(RuntimeError):
@@ -238,8 +240,10 @@ def make_mirrored_sample(
         x0, y0, x1, y1 = mirrored["bbox"]
         mirrored["bbox"] = [1.0 - x1, y0, 1.0 - x0, y1]
     theta_idx = int(mirrored.get("polar_theta_idx", -1))
-    if theta_idx >= 0:
-        mirrored["polar_theta_idx"] = (-theta_idx) % 60
+    if theta_idx >= 0 and "bbox" in mirrored:
+        x0, _y0, x1, _y1 = mirrored["bbox"]
+        mirrored_theta = theta_from_normalized_cx((x0 + x1) / 2.0)
+        mirrored["polar_theta_idx"] = discretize_theta(mirrored_theta)
     return mirrored
 
 
@@ -251,13 +255,18 @@ def estimate_target_from_frame(frame, detector=None):
     return detected
 
 
+def theta_from_normalized_cx(cx, fov_deg=60):
+    return (float(cx) - 0.5) * math.radians(float(fov_deg))
+
+
 def bbox_to_polar(cx, cy, frame_w, frame_h, fov_deg=60, bbox_h=None):
     """Convert normalized bbox geometry to approximate polar coordinates."""
 
     del frame_w, frame_h
-    theta_rad = (float(cx) - 0.5) * math.radians(float(fov_deg))
+    theta_rad = theta_from_normalized_cx(cx, fov_deg)
     if bbox_h is None:
-        # Compatibility for external callers; builder always supplies bbox_h.
+        # Haar detects a face rather than a full body, so use its vertical
+        # position instead of applying the full-person apparent-height scale.
         dist_est = max(0.5, 3.0 * (1.0 - (float(cy) * 0.8)))
     else:
         # A standing person's apparent height is approximately inverse to
@@ -266,17 +275,56 @@ def bbox_to_polar(cx, cy, frame_w, frame_h, fov_deg=60, bbox_h=None):
     return theta_rad, dist_est
 
 
-def discretize_theta(theta_rad, n_theta=60):
+def discretize_theta(theta_rad, n_theta=POLAR_THETA_BINS):
     degrees = (math.degrees(theta_rad) + 180.0) % 360.0
     return min(int(degrees * n_theta / 360.0), n_theta - 1)
 
 
-def discretize_dist(dist_m, n_dist=30, dmin=0.6, dmax=5.0):
+def discretize_dist(dist_m, n_dist=POLAR_DISTANCE_BINS, dmin=0.6, dmax=5.0):
     if dist_m <= dmin:
         return 0
     if dist_m >= dmax:
         return n_dist - 1
     return min(int((dist_m - dmin) * n_dist / (dmax - dmin)), n_dist - 1)
+
+
+def summarize_polar_by_detection_source(samples):
+    grouped = {}
+    for sample in samples:
+        source = str(sample.get("detection_source", "unknown"))
+        group = grouped.setdefault(
+            source,
+            {"samples": 0, "valid": 0, "invalid": 0, "distance_bins": Counter()},
+        )
+        group["samples"] += 1
+        valid = float(sample.get("polar_invalid", 1.0)) < 0.5
+        if valid:
+            group["valid"] += 1
+            dist_idx = int(sample.get("polar_dist_idx", -1))
+            if dist_idx >= 0:
+                group["distance_bins"][dist_idx] += 1
+        else:
+            group["invalid"] += 1
+
+    summary = {}
+    for source, group in sorted(grouped.items()):
+        valid = group["valid"]
+        distance_bins = group["distance_bins"]
+        max_bin_count = distance_bins.get(POLAR_DISTANCE_BINS - 1, 0)
+        weighted_total = sum(index * count for index, count in distance_bins.items())
+        summary[source] = {
+            "samples": group["samples"],
+            "valid": valid,
+            "invalid": group["invalid"],
+            "valid_rate": valid / max(1, group["samples"]),
+            "distance_bin_distribution": {
+                str(index): count for index, count in sorted(distance_bins.items())
+            },
+            "mean_distance_bin": weighted_total / valid if valid else None,
+            "max_distance_bin_count": max_bin_count,
+            "max_distance_bin_rate": max_bin_count / max(1, valid),
+        }
+    return summary
 
 
 def _frame_index(path: Path) -> int:
@@ -522,7 +570,7 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             current = serialize_image_path(current_frame_path, args.absolute_paths)
             frame = cv2.imread(str(current_frame_path))
             haar_detection = detector.detect_haar(frame) if frame is not None else None
-            detected, _detection_source = (
+            detected, detection_source = (
                 detector.detect(frame, haar_result=haar_detection) if frame is not None else (None, "none")
             )
             if detected is not None:
@@ -532,7 +580,7 @@ def build_dataset(args, detector_factory=get_default_target_detector):
                     cy,
                     frame.shape[1],
                     frame.shape[0],
-                    bbox_h=bbox_height,
+                    bbox_h=bbox_height if detection_source == "omdet" else None,
                 )
                 theta_idx = discretize_theta(theta_rad)
                 dist_idx = discretize_dist(dist_m)
@@ -578,6 +626,7 @@ def build_dataset(args, detector_factory=get_default_target_detector):
                 "polar_theta_idx": theta_idx,
                 "polar_dist_idx": dist_idx,
                 "polar_invalid": invalid,
+                "detection_source": detection_source,
             }
             if detected is not None:
                 sample["bbox"] = [
@@ -591,7 +640,7 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             split_samples[split].append(sample)
             if haar_detection is not None:
                 split_haar_valid[split] += 1
-            if mirror_augment and contains_turn(step_actions, prev_action):
+            if split == "train" and mirror_augment and contains_turn(step_actions, prev_action):
                 source_images = [
                     frames[t - args.history + index]
                     for index in range(args.history)
@@ -640,6 +689,9 @@ def build_dataset(args, detector_factory=get_default_target_detector):
         path_root = os.path.relpath(PROJECT_ROOT.resolve(), output_parent)
         split_commands = Counter(str(sample.get("command")) for sample in samples)
         split_transitions = Counter(str(sample.get("transition_type")) for sample in samples)
+        split_detection_sources = Counter(
+            str(sample.get("detection_source", "unknown")) for sample in samples
+        )
         split_polar_valid = sum(float(sample.get("polar_invalid", 1.0)) < 0.5 for sample in samples)
         return {
             "schema_version": 1,
@@ -656,7 +708,12 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             "action_semantics": semantics_value,
             "label_mode": label_mode,
             "delta_scale": 1.0,
-            "distance_source": "heuristic_bbox",
+            "distance_source": "source_aware_heuristic",
+            "distance_source_by_detection": {
+                "omdet": "inverse_full_body_bbox_height",
+                "haar": "face_bbox_vertical_position",
+            },
+            "mirror_augment": bool(mirror_augment and split_name == "train"),
             "split": split_name,
             "statistics": {
                 "sample_count": len(samples),
@@ -664,11 +721,13 @@ def build_dataset(args, detector_factory=get_default_target_detector):
                 "mirrored_count": sum(bool(sample.get("mirrored")) for sample in samples),
                 "command_distribution": dict(sorted(split_commands.items())),
                 "transition_type_distribution": dict(sorted(split_transitions.items())),
+                "detection_source_distribution": dict(sorted(split_detection_sources.items())),
                 "polar_valid": split_polar_valid,
                 "polar_invalid": len(samples) - split_polar_valid,
                 "polar_valid_rate": split_polar_valid / max(1, len(samples)),
                 "haar_baseline_valid": split_haar_valid[split_name],
                 "haar_baseline_valid_rate": split_haar_valid[split_name] / max(1, len(samples)),
+                "polar_by_detection_source": summarize_polar_by_detection_source(samples),
                 "episode_reports": [
                     {
                         key: report.get(key)
@@ -715,6 +774,7 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             "manifest": str(val_manifest_path),
             "sample_count": val_manifest["statistics"]["sample_count"],
             "episodes": sorted(val_episodes),
+            "mirror_augment": val_manifest["mirror_augment"],
         }
         with manifest_path.open("w", encoding="utf-8") as handle:
             json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)

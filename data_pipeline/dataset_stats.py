@@ -65,6 +65,8 @@ def compute_dataset_stats(dataset_path) -> dict:
     transition_counts = Counter()
     total = 0
     polar_valid = 0
+    detection_source_counts = Counter()
+    polar_by_source = {}
     deltas = {"delta_pos": [], "delta_vel": []}
 
     for sample in load_jsonl(path):
@@ -73,6 +75,23 @@ def compute_dataset_stats(dataset_path) -> dict:
         transition_counts[str(sample.get("transition_type", "<missing>"))] += 1
         if float(sample.get("polar_invalid", 1.0)) < 0.5:
             polar_valid += 1
+            polar_is_valid = True
+        else:
+            polar_is_valid = False
+        source = str(sample.get("detection_source", "unknown"))
+        detection_source_counts[source] += 1
+        source_stats = polar_by_source.setdefault(
+            source,
+            {"samples": 0, "valid": 0, "invalid": 0, "distance_bins": Counter()},
+        )
+        source_stats["samples"] += 1
+        if polar_is_valid:
+            source_stats["valid"] += 1
+            dist_idx = int(sample.get("polar_dist_idx", -1))
+            if dist_idx >= 0:
+                source_stats["distance_bins"][dist_idx] += 1
+        else:
+            source_stats["invalid"] += 1
         for field in deltas:
             if field in sample:
                 _flatten_vectors(sample[field], deltas[field])
@@ -95,16 +114,37 @@ def compute_dataset_stats(dataset_path) -> dict:
         fps_report["episodes"] = episode_fps
         fps_report["consistent"] = len({float(value) for value in episode_fps}) <= 1 if episode_fps else None
 
+    polar_source_summary = {}
+    for source, source_stats in sorted(polar_by_source.items()):
+        valid = source_stats["valid"]
+        distance_bins = source_stats["distance_bins"]
+        max_bin_count = distance_bins.get(29, 0)
+        weighted_total = sum(index * count for index, count in distance_bins.items())
+        polar_source_summary[source] = {
+            "samples": source_stats["samples"],
+            "valid": valid,
+            "invalid": source_stats["invalid"],
+            "valid_rate": valid / max(1, source_stats["samples"]),
+            "distance_bin_distribution": {
+                str(index): count for index, count in sorted(distance_bins.items())
+            },
+            "mean_distance_bin": weighted_total / valid if valid else None,
+            "max_distance_bin_count": max_bin_count,
+            "max_distance_bin_rate": max_bin_count / max(1, valid),
+        }
+
     return {
         "dataset": str(path),
         "samples": total,
         "command_distribution": dict(sorted(command_counts.items())),
         "transition_type_distribution": dict(sorted(transition_counts.items())),
+        "detection_source_distribution": dict(sorted(detection_source_counts.items())),
         "polar": {
             "valid": polar_valid,
             "invalid": total - polar_valid,
             "valid_rate": polar_valid / max(1, total),
         },
+        "polar_by_detection_source": polar_source_summary,
         "fps": fps_report,
         "delta_ranges": {field: _range_stats(values) for field, values in deltas.items()},
     }
@@ -123,7 +163,9 @@ def main(argv=None):
     print(f"samples: {stats['samples']}")
     print(f"command: {stats['command_distribution']}")
     print(f"transition_type: {stats['transition_type_distribution']}")
+    print(f"detection_source: {stats['detection_source_distribution']}")
     print(f"Polar: {stats['polar']}")
+    print(f"Polar by detection source: {stats['polar_by_detection_source']}")
     print(f"fps: {stats['fps']}")
     print(f"delta ranges: {stats['delta_ranges']}")
 

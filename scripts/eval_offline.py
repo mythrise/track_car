@@ -59,7 +59,11 @@ def transition_event_mask(actions, prev_actions, threshold=0.2):
     sequence = np.asarray(actions, dtype=np.float64)
     previous = np.asarray(prev_actions, dtype=np.float64)
     prior_yaw = np.concatenate((previous[:, None, 2], sequence[:, :-1, 2]), axis=1)
-    return np.abs(sequence[..., 2] - prior_yaw) > float(threshold)
+    yaw = sequence[..., 2]
+    active = np.abs(yaw) > float(threshold)
+    prior_active = np.abs(prior_yaw) > float(threshold)
+    sign_flip = active & prior_active & (np.sign(yaw) != np.sign(prior_yaw))
+    return (active != prior_active) | sign_flip
 
 
 def _safe_ratio(numerator, denominator):

@@ -18,6 +18,15 @@ class StubDetector:
         return (0.5, 0.5, 0.25, 0.5), "omdet"
 
 
+class HaarStubDetector:
+    def detect_haar(self, _frame):
+        return (0.5, 0.4, 0.15, 0.1)
+
+    def detect(self, _frame, haar_result=None):
+        assert haar_result is not None
+        return haar_result, "haar"
+
+
 def write_episode(root: Path, *, empty_meta_index=None):
     episode = root / "collected" / "ep001"
     episode.mkdir(parents=True)
@@ -89,7 +98,9 @@ def test_builder_writes_repo_relative_paths_and_sidecar_manifest(tmp_path, monke
     assert manifest["path_root"] == "."
     assert manifest["label_mode"] == "absolute"
     assert manifest["action_semantics"] == "arc_turn_v2"
-    assert manifest["distance_source"] == "heuristic_bbox"
+    assert manifest["distance_source"] == "source_aware_heuristic"
+    assert samples[0]["detection_source"] == "omdet"
+    assert manifest["statistics"]["detection_source_distribution"] == {"omdet": 3}
 
     lines = (tmp_path / "train.jsonl").read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[0])["episode"] == "ep001"
@@ -105,6 +116,21 @@ def test_absolute_path_mode_remains_absolute(tmp_path):
 
 def test_actions_outside_step_action_range_are_rejected():
     assert builder.meta_to_action({"action": [1.01, 0.0, 0.0]}) is None
+
+
+def test_haar_distance_uses_vertical_position_instead_of_full_body_height(tmp_path, monkeypatch):
+    monkeypatch.setattr(builder, "PROJECT_ROOT", tmp_path)
+    write_episode(tmp_path)
+    samples, manifest = builder.build_dataset(
+        args_for(tmp_path),
+        detector_factory=lambda device: HaarStubDetector(),
+    )
+    assert {sample["detection_source"] for sample in samples} == {"haar"}
+    assert {sample["polar_dist_idx"] for sample in samples} != {builder.POLAR_DISTANCE_BINS - 1}
+    assert manifest["statistics"]["detection_source_distribution"] == {"haar": 3}
+    assert manifest["statistics"]["polar_by_detection_source"]["haar"][
+        "max_distance_bin_rate"
+    ] == 0.0
 
 
 def test_empty_meta_fails_closed_before_detector_load(tmp_path, monkeypatch):
@@ -159,7 +185,35 @@ def test_step_action_labels_are_per_step_not_cumulative():
     np.testing.assert_allclose(delta_vel, [[0.5, 0.0, 0.5], [-0.75, 0.0, -1.0]])
 
 
-def test_step_builder_mirrors_only_turn_samples_and_writes_val_split(tmp_path, monkeypatch):
+def test_mirrored_polar_theta_is_recomputed_from_mirrored_bbox(tmp_path, monkeypatch):
+    monkeypatch.setattr(builder, "PROJECT_ROOT", tmp_path)
+    source = tmp_path / "frame.jpg"
+    cv2.imwrite(str(source), np.zeros((8, 8, 3), dtype=np.uint8))
+    cx = 0.63
+    theta, _ = builder.bbox_to_polar(cx, 0.5, 8, 8, bbox_h=0.5)
+    sample = {
+        "images": [],
+        "current": str(source),
+        "command": "turn_left",
+        "prev_action": [1.0, 0.0, 0.5],
+        "step_actions": [[1.0, 0.0, 0.5]],
+        "bbox": [0.53, 0.25, 0.73, 0.75],
+        "polar_theta_idx": builder.discretize_theta(theta),
+    }
+    mirrored = builder.make_mirrored_sample(
+        sample,
+        [source],
+        tmp_path / "mirrors",
+        tmp_path,
+        SimpleNamespace(absolute_paths=True),
+        fps=10,
+    )
+    mirrored_cx = (mirrored["bbox"][0] + mirrored["bbox"][2]) / 2.0
+    expected_theta, _ = builder.bbox_to_polar(mirrored_cx, 0.5, 8, 8, bbox_h=0.5)
+    assert mirrored["polar_theta_idx"] == builder.discretize_theta(expected_theta)
+
+
+def test_step_builder_does_not_mirror_validation_split(tmp_path, monkeypatch):
     monkeypatch.setattr(builder, "PROJECT_ROOT", tmp_path)
     episode = write_episode(tmp_path)
     actions = [
@@ -199,20 +253,16 @@ def test_step_builder_mirrors_only_turn_samples_and_writes_val_split(tmp_path, m
     originals = [sample for sample in val_lines if not sample["mirrored"]]
     mirrors = [sample for sample in val_lines if sample["mirrored"]]
     assert len(originals) == 3
-    assert len(mirrors) == 3
-    assert mirrors[0]["step_actions"][0][2] == -originals[0]["step_actions"][0][2]
-    assert mirrors[0]["prev_action"][2] == -originals[0]["prev_action"][2]
-    assert Path(tmp_path / mirrors[0]["current"]).is_file()
-    mirrored_frame = cv2.imread(str(tmp_path / mirrors[0]["current"]))
-    original_frame = cv2.imread(str(episode / "frame_000001.jpg"))
-    np.testing.assert_allclose(mirrored_frame, cv2.flip(original_frame, 1), atol=2)
+    assert mirrors == []
     val_manifest = json.loads(
         Path(str(tmp_path / "heldout.jsonl") + ".manifest.json").read_text(encoding="utf-8")
     )
-    assert val_manifest["statistics"]["mirrored_count"] == 3
-    assert val_manifest["statistics"]["sample_count"] == 6
+    assert val_manifest["statistics"]["mirrored_count"] == 0
+    assert val_manifest["statistics"]["sample_count"] == 3
+    assert val_manifest["mirror_augment"] is False
     assert val_manifest["split"] == "val"
     train_manifest = json.loads(
         Path(str(tmp_path / "train.jsonl") + ".manifest.json").read_text(encoding="utf-8")
     )
-    assert train_manifest["validation"]["sample_count"] == 6
+    assert train_manifest["validation"]["sample_count"] == 3
+    assert train_manifest["validation"]["mirror_augment"] is False

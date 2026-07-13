@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from inference_pipeline import mac_server
 
@@ -13,6 +14,91 @@ def safety_args(**overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def real_model_args(**overrides):
+    values = {
+        "timeout": 2.0,
+        "mock_control": False,
+        "history": 1,
+        "warmup_frames": 1,
+        "state_mode": "stateless",
+        "label_mode": "step_action",
+        "control_dt": 0.1,
+        "control_waypoint_index": 0,
+        "motor_scale": 400.0,
+        "min_motor_delta": 0,
+        "max_action_abs": 1.0,
+        "max_action_rate": 2.0,
+        "action_ema": 0.5,
+        "stop_confidence": 0.3,
+        "invalid_stop_frames": 5,
+        "max_waypoint_abs": 2.0,
+        "pan_recenter_per_s": 30.0,
+        "shadow_mode": False,
+        "aux_delta_vel": False,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+class StubStepModel:
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.forward_calls = 0
+        self.prev_actions = []
+
+    def init_state(self, batch_size, device):
+        return {"batch_size": batch_size, "device": str(device)}
+
+    def forward_step(self, **kwargs):
+        self.prev_actions.append(kwargs["prev_action"].detach().cpu().tolist()[0])
+        spec = self.outputs[self.forward_calls]
+        self.forward_calls += 1
+        waypoints = spec.get("waypoints", [[0.1, 0.0, 0.0]])
+        step_actions = spec.get("step_actions", [[1.0, 0.0, 0.0]])
+        return {
+            "new_state": {"call": self.forward_calls},
+            "waypoints": torch.tensor([waypoints], dtype=torch.float32),
+            "step_actions": torch.tensor([step_actions], dtype=torch.float32),
+            "C": torch.tensor([spec.get("confidence", 1.0)], dtype=torch.float32),
+            "cot_decoded": {
+                "invalid_pred": torch.tensor([spec.get("invalid_pred", False)]),
+                "theta_deg": torch.tensor([spec.get("theta_deg", 0.0)], dtype=torch.float32),
+            },
+            "orch": {"mode": torch.tensor([spec.get("mode", 0)])},
+        }
+
+
+def run_real_model_connection(monkeypatch, outputs, **arg_overrides):
+    class FakeConnection:
+        def settimeout(self, value):
+            self.timeout = value
+
+    model = StubStepModel(outputs)
+    frames = iter([object()] * (1 + len(outputs)) + [None])
+    sent = []
+    monotonic_ticks = iter(index * 0.1 for index in range(2 + len(outputs)))
+    monkeypatch.setattr(mac_server, "recv_json", lambda _conn: {"instruction": "follow"})
+    monkeypatch.setattr(mac_server, "recv_jpeg_frame", lambda _conn: next(frames))
+    monkeypatch.setattr(mac_server, "send_json", lambda _conn, payload: sent.append(payload))
+    monkeypatch.setattr(mac_server, "encode_frame", lambda _frame, _encoder: (object(), object()))
+    monkeypatch.setattr(
+        mac_server,
+        "build_tokens",
+        lambda _history, _fine, _count: (
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.zeros(1),
+            torch.zeros(1),
+        ),
+    )
+    monkeypatch.setattr(mac_server.time, "monotonic", lambda: next(monotonic_ticks))
+    args = real_model_args(**arg_overrides)
+    processed = mac_server.handle_connection(
+        FakeConnection(), ("local", 1), args, model, object(), torch.device("cpu")
+    )
+    return processed, sent, model
 
 
 def test_coarse_history_excludes_current_frame_at_inference():
@@ -213,7 +299,7 @@ def test_pan_deadzone_and_invalid_recenter_are_rate_limited_per_second():
         elapsed=0.5,
         pan_recenter_per_s=30.0,
     )
-    assert pan == 1585
+    assert pan == 1600
     pan, _ = mac_server.waypoint_to_pan_tilt(
         20,
         current_pan=1600,
@@ -222,6 +308,58 @@ def test_pan_deadzone_and_invalid_recenter_are_rate_limited_per_second():
         pan_recenter_per_s=30.0,
     )
     assert pan == 1570
+
+
+def test_handle_connection_warmup_skips_model_and_sends_stop(monkeypatch):
+    processed, sent, model = run_real_model_connection(monkeypatch, [])
+    assert processed == 1
+    assert model.forward_calls == 0
+    assert sent[0]["motors"] == mac_server.NEUTRAL_MOTORS
+    assert sent[0]["stop"] is True
+    assert sent[0]["debug"]["stop_reason"] == "warmup"
+
+
+@pytest.mark.parametrize(
+    ("outputs", "expected_reason"),
+    [
+        ([{"confidence": 0.2}], "low_confidence"),
+        ([{"waypoints": [[2.1, 0.0, 0.0]]}], "waypoint_out_of_bounds"),
+        ([{"invalid_pred": True}] * 5, "invalid_streak"),
+    ],
+)
+def test_handle_connection_safety_failures_send_neutral_stop(
+    monkeypatch, outputs, expected_reason
+):
+    _, sent, _model = run_real_model_connection(monkeypatch, outputs)
+    payload = sent[-1]
+    assert payload["motors"] == mac_server.NEUTRAL_MOTORS
+    assert payload["stop"] is True
+    assert expected_reason in payload["debug"]["safety_stop_reasons"]
+
+
+def test_handle_connection_shadow_mode_sends_neutral_stop_without_safety_trigger(monkeypatch):
+    _, sent, model = run_real_model_connection(monkeypatch, [{}], shadow_mode=True)
+    payload = sent[-1]
+    assert model.forward_calls == 1
+    assert payload["motors"] == mac_server.NEUTRAL_MOTORS
+    assert payload["stop"] is True
+    assert payload["debug"]["shadow_mode"] is True
+    assert "safety_stop_reasons" not in payload["debug"]
+
+
+def test_aux_prev_action_uses_raw_model_action_while_safety_filter_uses_filtered_action(
+    monkeypatch,
+):
+    _, sent, model = run_real_model_connection(
+        monkeypatch,
+        [{"step_actions": [[1.0, 0.0, 0.0]]}, {"step_actions": [[1.0, 0.0, 0.0]]}],
+        aux_delta_vel=True,
+    )
+    torch.testing.assert_close(
+        torch.tensor(model.prev_actions),
+        torch.tensor([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+    )
+    assert sent[-1]["debug"]["previous_action"] == pytest.approx([0.1, 0.0, 0.0])
 
 
 def test_shadow_mode_never_sends_intended_motors():

@@ -359,9 +359,11 @@ def waypoint_to_pan_tilt(
         and not bool(invalid_pred)
         and float(confidence) >= float(stop_confidence)
     )
-    if not valid_target or abs(float(cot_theta_deg)) < 2.0:
+    if not valid_target:
         pan = _recenter_pan(current_pan, elapsed, pan_recenter_per_s)
         return max(500, min(2500, pan)), int(current_tilt)
+    if abs(float(cot_theta_deg)) < 2.0:
+        return int(current_pan), int(current_tilt)
     pan_delta = -float(cot_theta_deg) * 3.0
     return max(500, min(2500, int(float(current_pan) + pan_delta))), int(current_tilt)
 
@@ -582,6 +584,7 @@ def handle_connection(conn, addr, args, model, encoder, device):
     pan, tilt = 1500, 1500
     invalid_streak = 0
     safety_state = {"last_action": [0.0, 0.0, 0.0]}
+    model_previous_action = [0.0, 0.0, 0.0]
     frame_count = 0
     last_frame_time = time.monotonic()
 
@@ -621,8 +624,13 @@ def handle_connection(conn, addr, args, model, encoder, device):
                     )
                     state = _initial_state_for_frame(model, args, rolling_state, batch_size, device)
                     with torch.inference_mode():
+                        previous_action_values = (
+                            model_previous_action
+                            if args.aux_delta_vel
+                            else safety_state["last_action"]
+                        )
                         previous_action = torch.tensor(
-                            [safety_state["last_action"]],
+                            [previous_action_values],
                             dtype=torch.float32,
                             device=device,
                         )
@@ -675,6 +683,7 @@ def handle_connection(conn, addr, args, model, encoder, device):
                         sent_motors = list(NEUTRAL_MOTORS)
                         stop = True
                         reset_safety_state(safety_state)
+                        model_previous_action = [0.0, 0.0, 0.0]
                         debug["safety_stop_reasons"] = reasons
                         debug["safety_state_reset"] = True
                         if args.state_mode == "rolling":
@@ -686,8 +695,11 @@ def handle_connection(conn, addr, args, model, encoder, device):
                             invalid_pred=invalid_pred,
                         )
                         if not state_committed:
+                            model_previous_action = [0.0, 0.0, 0.0]
                             debug["safety_state_reset"] = True
                             debug["safety_state_reset_reason"] = "invalid_pred"
+                        elif args.label_mode == "step_action":
+                            model_previous_action = list(debug["raw_action"])
 
                     if args.shadow_mode:
                         sent_motors, stop, debug = apply_shadow_output(intended_motors, debug)

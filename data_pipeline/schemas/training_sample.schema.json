@@ -63,6 +63,7 @@
     "command": {"type": ["string", "null"]},
     "polar_theta_idx": {"type": "integer"},
     "polar_dist_idx": {"type": "integer"},
-    "polar_invalid": {"type": "number"}
+    "polar_invalid": {"type": "number"},
+    "detection_source": {"enum": ["omdet", "haar", "none"]}
   }
 }

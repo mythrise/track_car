@@ -5,4 +5,6 @@ pyserial>=3.5
 pytest>=8.0
 safetensors>=0.4
 torch>=2.1
+torchvision>=0.23
 transformers>=4.51
+timm>=1.0

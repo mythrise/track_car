@@ -23,11 +23,24 @@ def load_omdet_components(device: str = "cpu"):
     import torch or initialize model weights.
     """
 
-    from transformers import AutoProcessor, OmDetTurboForObjectDetection
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    from transformers import AutoConfig, AutoProcessor, OmDetTurboForObjectDetection
 
     kwargs = {"local_files_only": True} if _offline_mode() else {}
     processor = AutoProcessor.from_pretrained(OMDET_MODEL_ID, **kwargs)
-    model = OmDetTurboForObjectDetection.from_pretrained(OMDET_MODEL_ID, **kwargs)
+    # Instantiate from config, then load weights manually: from_pretrained()
+    # leaves the timm swin backbone's non-persistent attn_mask buffers on the
+    # meta device (they are not in the checkpoint), and .to(device) then fails
+    # with "Cannot copy out of meta tensor".
+    config = AutoConfig.from_pretrained(OMDET_MODEL_ID, **kwargs)
+    model = OmDetTurboForObjectDetection(config)
+    state_path = hf_hub_download(OMDET_MODEL_ID, "model.safetensors", **kwargs)
+    missing, unexpected = model.load_state_dict(load_file(state_path), strict=False)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"OmDet-Turbo weights incomplete: {len(missing)} missing, {len(unexpected)} unexpected"
+        )
     return processor, model.to(device).eval()
 
 
@@ -126,9 +139,12 @@ class PersonTargetDetector:
         if self._fallback_warned:
             return
         self._fallback_warned = True
+        reason_text = " ".join(str(reason).split())
+        if not reason_text:
+            reason_text = type(reason).__name__ if reason is not None else "unknown"
         self.warning_sink(
             "!!! [target_detector] OmDet-Turbo unavailable; FALLING BACK TO HAAR FRONTAL-FACE "
-            f"pseudo-labels. Polar coverage/quality will be lower. reason={reason}"
+            f"pseudo-labels. Polar coverage/quality will be lower. reason={reason_text}"
         )
 
     def _ensure_omdet(self) -> None:

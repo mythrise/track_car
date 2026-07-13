@@ -6,6 +6,7 @@ from scripts.eval_offline import (
     compute_metrics,
     evaluate_predictions,
     render_comparison_table,
+    transition_event_mask,
     waypoints_to_step_actions,
 )
 
@@ -25,6 +26,15 @@ def test_offline_metrics_cover_axis_sign_transition_and_saturation():
     assert metrics["turn_sign_accuracy"] == 1.0
     assert metrics["transition"]["f1"] == 1.0
     assert metrics["saturation_rate"]["forward"] == pytest.approx(2.0 / 3.0)
+
+
+def test_transition_events_follow_turn_activity_and_sign_not_yaw_difference():
+    actions = np.asarray([[[0.0, 0.0, 0.25], [0.0, 0.0, 0.7], [0.0, 0.0, -0.4], [0.0, 0.0, 0.0]]])
+    previous = np.asarray([[0.0, 0.0, 0.1]])
+    np.testing.assert_array_equal(
+        transition_event_mask(actions, previous, threshold=0.2),
+        [[True, False, True, True]],
+    )
 
 
 def test_offline_evaluation_groups_transition_types_and_renders_multiple_runs():
