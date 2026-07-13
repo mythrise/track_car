@@ -15,6 +15,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 BUNDLED_OPENTRACKVLA_ROOT = PROJECT_ROOT / "third_party" / "OpenTrackVLA"
 NEUTRAL_MOTORS = [1500, 1500, 1500, 1500]
+REQUIRED_CHECKPOINT_META_FIELDS = ("schema_version", "label_mode", "history", "dt")
 
 sys.path.insert(0, str(PROJECT_ROOT / "car_runtime"))
 try:
@@ -192,7 +193,7 @@ def enforce_checkpoint_policy(
             print("!!! [server] WARNING: no PFEM checkpoint; random init allowed only because shadow mode is active")
             return
         raise FileNotFoundError("PFEM checkpoint is required in non-mock mode")
-    model_state = checkpoint.get("model_state")
+    model_state = checkpoint.get("model_state") if isinstance(checkpoint, dict) else None
     if not isinstance(model_state, dict):
         missing = ["model_state"] + critical_checkpoint_prefixes(label_mode, aux_delta_vel)
     else:
@@ -203,6 +204,61 @@ def enforce_checkpoint_policy(
             print(f"!!! [server] WARNING: {message}; random values remain shadow-only")
             return
         raise RuntimeError(message)
+
+
+def validate_checkpoint_metadata(
+    checkpoint,
+    allow_random_init: bool = False,
+    shadow_mode: bool = False,
+):
+    """Return validated control metadata, except for the explicit shadow-only escape hatch."""
+
+    if allow_random_init and shadow_mode:
+        if isinstance(checkpoint, dict) and isinstance(checkpoint.get("meta"), dict):
+            return checkpoint["meta"]
+        return None
+    if checkpoint is None:
+        return None
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError("PFEM checkpoint must be a mapping with model_state and meta")
+    meta = checkpoint.get("meta")
+    if not isinstance(meta, dict):
+        raise RuntimeError(
+            "checkpoint meta is required in non-mock mode; missing control metadata: "
+            + ", ".join(REQUIRED_CHECKPOINT_META_FIELDS)
+        )
+    missing = [
+        field
+        for field in REQUIRED_CHECKPOINT_META_FIELDS
+        if field not in meta or meta[field] is None
+    ]
+    if missing:
+        raise RuntimeError("checkpoint meta missing required fields: " + ", ".join(missing))
+    try:
+        schema_version = int(meta["schema_version"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"invalid checkpoint meta schema_version={meta['schema_version']!r}"
+        ) from exc
+    if schema_version != 1:
+        raise RuntimeError(
+            f"unsupported checkpoint meta schema_version={meta['schema_version']!r}; expected 1"
+        )
+    if str(meta["label_mode"]) not in {"absolute", "step_action"}:
+        raise RuntimeError(f"invalid checkpoint meta label_mode={meta['label_mode']!r}")
+    try:
+        history = int(meta["history"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid checkpoint meta history={meta['history']!r}") from exc
+    if history <= 0:
+        raise RuntimeError("checkpoint meta history must be > 0")
+    try:
+        dt = float(meta["dt"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"invalid checkpoint meta dt={meta['dt']!r}") from exc
+    if not math.isfinite(dt) or dt <= 0:
+        raise RuntimeError("checkpoint meta dt must be finite and > 0")
+    return meta
 
 
 def _option_is_explicit(argv, option: str) -> bool:
@@ -352,6 +408,7 @@ def waypoint_to_pan_tilt(
     stop_confidence=0.3,
     elapsed=0.0,
     pan_recenter_per_s=30.0,
+    pan_deadzone_deg=4.0,
 ):
     valid_target = (
         math.isfinite(float(cot_theta_deg))
@@ -362,7 +419,7 @@ def waypoint_to_pan_tilt(
     if not valid_target:
         pan = _recenter_pan(current_pan, elapsed, pan_recenter_per_s)
         return max(500, min(2500, pan)), int(current_tilt)
-    if abs(float(cot_theta_deg)) < 2.0:
+    if abs(float(cot_theta_deg)) < float(pan_deadzone_deg):
         return int(current_pan), int(current_tilt)
     pan_delta = -float(cot_theta_deg) * 3.0
     return max(500, min(2500, int(float(current_pan) + pan_delta))), int(current_tilt)
@@ -675,6 +732,7 @@ def handle_connection(conn, addr, args, model, encoder, device):
                         stop_confidence=args.stop_confidence,
                         elapsed=elapsed,
                         pan_recenter_per_s=args.pan_recenter_per_s,
+                        pan_deadzone_deg=args.pan_deadzone_deg,
                     )
 
                     sent_motors = intended_motors
@@ -794,6 +852,12 @@ def build_parser():
     parser.add_argument("--invalid_stop_frames", type=int, default=5)
     parser.add_argument("--max_waypoint_abs", type=float, default=2.0)
     parser.add_argument("--pan_recenter_per_s", type=float, default=30.0)
+    parser.add_argument(
+        "--pan_deadzone_deg",
+        type=float,
+        default=4.0,
+        help="Freeze pan when decoded |theta| is below this threshold (default: 4 degrees).",
+    )
     parser.add_argument("--label_mode", choices=("absolute", "step_action"), default=None)
     parser.add_argument(
         "--aux_delta_vel",
@@ -833,6 +897,8 @@ def validate_args(parser, args):
         parser.error("--max_waypoint_abs must be > 0")
     if args.pan_recenter_per_s < 0:
         parser.error("--pan_recenter_per_s must be >= 0")
+    if not math.isfinite(args.pan_deadzone_deg) or args.pan_deadzone_deg < 0:
+        parser.error("--pan_deadzone_deg must be finite and >= 0")
     if args.allow_random_init and not args.shadow_mode:
         parser.error("--allow_random_init requires --shadow_mode")
     if args.warmup_frames is None:
@@ -869,7 +935,12 @@ def main(argv=None):
         checkpoint = None
         if args.ckpt and Path(args.ckpt).is_file():
             checkpoint = torch.load(args.ckpt, map_location="cpu")
-        apply_checkpoint_metadata(args, checkpoint.get("meta") if checkpoint else None, raw_argv)
+        checkpoint_meta = validate_checkpoint_metadata(
+            checkpoint,
+            args.allow_random_init,
+            args.shadow_mode,
+        )
+        apply_checkpoint_metadata(args, checkpoint_meta, raw_argv)
         validate_args(parser, args)
         enforce_checkpoint_policy(
             checkpoint,

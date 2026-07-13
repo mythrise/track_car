@@ -35,6 +35,7 @@ def real_model_args(**overrides):
         "invalid_stop_frames": 5,
         "max_waypoint_abs": 2.0,
         "pan_recenter_per_s": 30.0,
+        "pan_deadzone_deg": 4.0,
         "shadow_mode": False,
         "aux_delta_vel": False,
     }
@@ -134,6 +135,7 @@ def test_ws1_cli_defaults_match_plan():
     assert args.invalid_stop_frames == 5
     assert args.max_waypoint_abs == 2.0
     assert args.pan_recenter_per_s == 30.0
+    assert args.pan_deadzone_deg == 4.0
     assert args.max_action_rate == 4.0
     assert args.action_ema == 0.5
 
@@ -278,6 +280,50 @@ def test_checkpoint_fail_closed_and_shadow_random_override():
     mac_server.enforce_checkpoint_policy(None, "absolute", True, True)
 
 
+@pytest.mark.parametrize("missing_field", mac_server.REQUIRED_CHECKPOINT_META_FIELDS)
+def test_checkpoint_metadata_requires_every_control_field(missing_field):
+    meta = {
+        "schema_version": 1,
+        "label_mode": "step_action",
+        "history": 31,
+        "dt": 0.1,
+    }
+    del meta[missing_field]
+    with pytest.raises(RuntimeError, match=missing_field):
+        mac_server.validate_checkpoint_metadata({"model_state": {}, "meta": meta})
+
+
+def test_shadow_random_override_keeps_legacy_missing_meta_behavior():
+    assert mac_server.validate_checkpoint_metadata(
+        {"model_state": {}}, allow_random_init=True, shadow_mode=True
+    ) is None
+
+
+def test_step_action_checkpoint_without_meta_is_rejected_during_startup(tmp_path):
+    checkpoint_path = tmp_path / "step_action_no_meta.pt"
+    torch.save(
+        {
+            "model_state": {
+                "context_proj.weight": torch.zeros(1),
+                "cot.theta_head.weight": torch.zeros(1),
+                "base.proj.net.0.weight": torch.zeros(1),
+                "step_action_head.trunk.0.weight": torch.zeros(1),
+            }
+        },
+        checkpoint_path,
+    )
+    with pytest.raises(RuntimeError, match="checkpoint meta is required"):
+        mac_server.main(
+            [
+                "--ckpt",
+                str(checkpoint_path),
+                "--opentrackvla_root",
+                str(mac_server.BUNDLED_OPENTRACKVLA_ROOT),
+                "--no_cleanup_port",
+            ]
+        )
+
+
 def test_checkpoint_requires_all_control_critical_groups():
     state = {
         "context_proj.weight": object(),
@@ -291,15 +337,19 @@ def test_checkpoint_requires_all_control_critical_groups():
     assert mac_server.missing_critical_checkpoint_keys(state, "absolute") == ["cot."]
 
 
-def test_pan_deadzone_and_invalid_recenter_are_rate_limited_per_second():
-    pan, _ = mac_server.waypoint_to_pan_tilt(
-        1.9,
-        current_pan=1600,
-        confidence=1.0,
-        elapsed=0.5,
-        pan_recenter_per_s=30.0,
-    )
+@pytest.mark.parametrize("theta_deg", [-3.0, 3.0])
+def test_pan_deadzone_freezes_real_decodable_three_degree_bins(theta_deg):
+    pan, _ = mac_server.waypoint_to_pan_tilt(theta_deg, current_pan=1600, confidence=1.0)
     assert pan == 1600
+
+
+@pytest.mark.parametrize(("theta_deg", "expected_pan"), [(-6.0, 1618), (6.0, 1582)])
+def test_pan_follows_real_decodable_six_degree_bins(theta_deg, expected_pan):
+    pan, _ = mac_server.waypoint_to_pan_tilt(theta_deg, current_pan=1600, confidence=1.0)
+    assert pan == expected_pan
+
+
+def test_invalid_pan_target_recenters_at_rate_limited_speed():
     pan, _ = mac_server.waypoint_to_pan_tilt(
         20,
         current_pan=1600,

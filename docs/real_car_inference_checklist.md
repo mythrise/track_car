@@ -3,7 +3,17 @@
 This checklist is for real-car TrackVLA/PFEM deployment. It focuses on the
 current failure mode where model inference runs, but the car barely moves.
 
-## 1. Do Not Treat Waypoints As Actions
+## 1. Match Decoding To The Checkpoint Label Mode
+
+Current training defaults to `label_mode=step_action`. In that mode the server
+uses `pred_step_actions[0]` directly, then applies rate limiting, EMA smoothing,
+and the motor mapping. The checkpoint metadata selects this path at startup;
+missing metadata is a hard error, not an implicit absolute-label fallback.
+
+The waypoint conversion below applies only to legacy `label_mode=absolute`
+checkpoints.
+
+### Legacy absolute-label checkpoints: do not treat waypoints as actions
 
 The model predicts future waypoints:
 
@@ -60,6 +70,10 @@ Recommended initial parameters:
 --control_waypoint_index 1
 ```
 
+These waypoint controls are ignored by the primary action decoder for a
+`step_action` checkpoint. Do not force `--label_mode`; let the validated
+checkpoint metadata select the matching decoder.
+
 With `waypoint[1].x ~= 0.2`, this gives:
 
 ```text
@@ -96,6 +110,11 @@ For communication-only testing, use mock mode first:
 ```powershell
 python inference_pipeline/mac_server.py --port 9999 --mock_control --mock_action stop --timeout 30
 ```
+
+Before lifted-car testing, run the real checkpoint with `--shadow_mode`. Shadow
+mode performs full inference but sends neutral stop motors. Random initialization
+is permitted only with the additional `--allow_random_init`, and must never be
+used for vehicle control.
 
 ## 3. Raspberry Pi Client Test Command
 

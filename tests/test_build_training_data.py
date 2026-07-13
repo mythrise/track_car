@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -105,7 +106,29 @@ def test_builder_writes_repo_relative_paths_and_sidecar_manifest(tmp_path, monke
     lines = (tmp_path / "train.jsonl").read_text(encoding="utf-8").splitlines()
     assert json.loads(lines[0])["episode"] == "ep001"
     sidecar = Path(str(tmp_path / "train.jsonl") + ".manifest.json")
-    assert json.loads(sidecar.read_text(encoding="utf-8"))["schema_version"] == 1
+    sidecar_data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert sidecar_data["schema_version"] == 1
+    assert sidecar_data["sample_count"] == len(lines) == 3
+    assert sidecar_data["data_jsonl_sha256"] == hashlib.sha256(
+        (tmp_path / "train.jsonl").read_bytes()
+    ).hexdigest()
+
+
+def test_all_samples_from_small_fixture_match_training_schema(tmp_path, monkeypatch):
+    monkeypatch.setattr(builder, "PROJECT_ROOT", tmp_path)
+    write_episode(tmp_path)
+    builder.build_dataset(
+        args_for(tmp_path, label_mode="step_action"),
+        detector_factory=lambda device: StubDetector(),
+    )
+    schema = json.loads(builder.TRAINING_SAMPLE_SCHEMA_PATH.read_text(encoding="utf-8"))
+    samples = [
+        json.loads(line)
+        for line in (tmp_path / "train.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert samples
+    for sample in samples:
+        builder.jsonschema.validate(instance=sample, schema=schema)
 
 
 def test_absolute_path_mode_remains_absolute(tmp_path):

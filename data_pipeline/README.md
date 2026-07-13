@@ -167,12 +167,24 @@ images
 instruction
 waypoints
 actions
+step_actions
+delta_pos
+delta_vel
+prev_action
+transition_type
 motors
 command
 polar_theta_idx
 polar_dist_idx
 polar_invalid
+detection_source
 ```
+
+The default label mode is `step_action`: each future action is a direct
+per-control-step target, while `waypoints` and `actions` remain for compatibility.
+The generated `<output>.manifest.json` records the JSONL SHA-256 and row count.
+`train_pfem.py` verifies both values and rejects step-action rows missing
+`step_actions`, `prev_action`, or `delta_vel`.
 
 Current waypoints are integrated from logged normalized actions. They are not
 meter-accurate odometry; treat them as imitation-control targets until the car
@@ -180,7 +192,7 @@ has calibrated odometry.
 
 ## Known Limitations
 
-- The current target detector is a simple Haar face detector.
-- For formal experiments, replace it with a person detector/tracker or manual
-  annotation.
+- Polar pseudo-labels prefer OmDet-Turbo person detection. If its local model
+  is unavailable, the builder emits a prominent warning and falls back to Haar
+  face detection; use a person tracker or manual annotation for formal labels.
 - There is no motor feedback or command acknowledgement.

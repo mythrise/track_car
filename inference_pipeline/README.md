@@ -62,8 +62,12 @@ python inference_pipeline/mac_server.py \
   --port 9999
 ```
 
-Without `--ckpt`, the server loads the PFEM wrapper with randomly initialized
-PFEM heads around the OpenTrackVLA base. That is useful only for plumbing tests.
+Full-model startup is fail-closed. A PFEM checkpoint is required, and its `meta`
+must include `schema_version`, `label_mode`, `history`, and `dt`; missing
+metadata or control-critical weights abort startup instead of defaulting to
+absolute labels. The only random-initialization escape hatch is
+`--allow_random_init --shadow_mode`, which performs inference but always sends
+neutral stop motors.
 
 ## Important
 

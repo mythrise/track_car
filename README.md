@@ -55,6 +55,10 @@ See `weights/README.md` for copy/download commands.
 
 Runtime model loading is local-only. If Qwen or SigLIP is missing locally, the
 server will fail with the checked paths instead of trying to download online.
+Non-mock inference is also fail-closed: the PFEM checkpoint and its
+`schema_version`, `label_mode`, `history`, and `dt` metadata must be present.
+Random PFEM initialization is only available with the explicit
+`--allow_random_init --shadow_mode` stop-only combination.
 
 ## Install
 
@@ -143,6 +147,11 @@ python data_pipeline/build_training_data.py \
   --input data/collected \
   --output data/car_train.jsonl
 ```
+
+Conversion uses OmDet-Turbo person boxes when available, with a warned Haar
+fallback. The default `step_action` samples include `step_actions`,
+`prev_action`, and `delta_vel`. The sidecar manifest binds the JSONL by SHA-256
+and row count; training rejects edited, truncated, or field-incomplete data.
 
 Train PFEM:
 

@@ -26,7 +26,7 @@ car_runtime/move_test.py
 camera frame + timestamp + keyboard/action + motor pulses
   -> data/collected/<episode>/
   -> data_pipeline/build_training_data.py
-  -> JSONL training samples
+  -> step_action JSONL training samples + SHA-256/row-count manifest
 ```
 
 Files:
@@ -44,7 +44,7 @@ Raspberry Pi frame
   -> car_protocol.py length-prefixed JPEG
   -> inference_pipeline/mac_server.py
   -> OpenTrackVLA/PFEM model
-  -> waypoint/action
+  -> checkpoint-selected step action or legacy waypoint action
   -> motor pulse command JSON
 ```
 
@@ -77,4 +77,6 @@ weights/weights_manifest.example.json
 The control and communication pipeline is runnable now. The full model pipeline
 has source code in this repo under `third_party/OpenTrackVLA`, but still needs
 local weights in the paths documented by `weights/README.md`. Always test in
-mock mode before enabling real model control.
+mock mode before enabling real model control. Non-mock startup requires a PFEM
+checkpoint with complete control metadata; use shadow mode for stop-only model
+verification before lifted-car testing.

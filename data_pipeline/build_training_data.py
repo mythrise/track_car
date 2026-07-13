@@ -5,14 +5,24 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import random
 import sys
 
 import cv2
 import numpy as np
+
+try:
+    import jsonschema
+except ModuleNotFoundError:
+    try:
+        from data_pipeline import jsonschema_fallback as jsonschema
+    except ModuleNotFoundError:
+        import jsonschema_fallback as jsonschema
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -32,6 +42,7 @@ SUPPORTED_ACTION_SEMANTICS = {"spin_v1", "arc_turn_v2"}
 TURN_THRESHOLD = 0.2
 POLAR_THETA_BINS = 60
 POLAR_DISTANCE_BINS = 30
+TRAINING_SAMPLE_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "training_sample.schema.json"
 
 
 class DataIntegrityError(RuntimeError):
@@ -470,6 +481,38 @@ def manifest_path_for(output: Path) -> Path:
     return Path(str(output) + ".manifest.json")
 
 
+def jsonl_sha256_and_row_count(path: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    row_count = 0
+    with path.open("rb") as handle:
+        for raw_line in handle:
+            digest.update(raw_line)
+            if raw_line.strip():
+                row_count += 1
+    return digest.hexdigest(), row_count
+
+
+def validate_training_sample_subset(samples, rng=None) -> list[int]:
+    if not samples:
+        return []
+    with TRAINING_SAMPLE_SCHEMA_PATH.open(encoding="utf-8") as handle:
+        schema = json.load(handle)
+    random_source = rng or random.SystemRandom()
+    remaining = list(range(1, len(samples)))
+    selected = [0]
+    if remaining:
+        selected.extend(random_source.sample(remaining, min(3, len(remaining))))
+    for index in selected:
+        try:
+            jsonschema.validate(instance=samples[index], schema=schema)
+        except jsonschema.ValidationError as exc:
+            location = ".".join(str(part) for part in exc.absolute_path) or "<root>"
+            raise DataIntegrityError(
+                f"training sample {index} failed JSON Schema at {location}: {exc.message}"
+            ) from exc
+    return selected
+
+
 def _common_value(values, label: str, lenient: bool):
     unique = sorted(set(values))
     if len(unique) == 1:
@@ -684,7 +727,7 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             f"({spin_turn_samples} turn samples including mirrors)."
         )
 
-    def build_manifest(samples, split_name, dataset_output):
+    def build_manifest(samples, split_name, dataset_output, data_sha256, row_count):
         output_parent = dataset_output.resolve().parent
         path_root = os.path.relpath(PROJECT_ROOT.resolve(), output_parent)
         split_commands = Counter(str(sample.get("command")) for sample in samples)
@@ -695,6 +738,8 @@ def build_dataset(args, detector_factory=get_default_target_detector):
         split_polar_valid = sum(float(sample.get("polar_invalid", 1.0)) < 0.5 for sample in samples)
         return {
             "schema_version": 1,
+            "data_jsonl_sha256": data_sha256,
+            "sample_count": row_count,
             "path_root": path_root,
             "path_mode": "absolute" if args.absolute_paths else "repo_relative",
             "fps": fps_value,
@@ -759,7 +804,20 @@ def build_dataset(args, detector_factory=get_default_target_detector):
         with dataset_output.open("w", encoding="utf-8") as handle:
             for sample in samples:
                 handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
-        split_manifest = build_manifest(samples, split_name, dataset_output)
+        validate_training_sample_subset(samples)
+        data_sha256, row_count = jsonl_sha256_and_row_count(dataset_output)
+        if row_count != len(samples):
+            raise DataIntegrityError(
+                f"JSONL row count changed while writing {dataset_output}: "
+                f"expected {len(samples)}, got {row_count}"
+            )
+        split_manifest = build_manifest(
+            samples,
+            split_name,
+            dataset_output,
+            data_sha256,
+            row_count,
+        )
         sidecar = manifest_path_for(dataset_output)
         with sidecar.open("w", encoding="utf-8") as handle:
             json.dump(split_manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)

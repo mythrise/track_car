@@ -28,6 +28,9 @@ from harness.core.event_sampling import compute_event_sampling_weights, weighted
 from local_weights import default_qwen_candidates, resolve_local_model_path
 
 
+STEP_ACTION_REQUIRED_FIELDS = ("step_actions", "prev_action", "delta_vel")
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_json", required=True)
@@ -73,21 +76,50 @@ def _single_manifest_value(value, field):
     return value
 
 
+def inspect_training_jsonl(dataset_path, label_mode):
+    dataset_path = Path(dataset_path)
+    if not dataset_path.is_file():
+        raise FileNotFoundError(f"Training JSONL does not exist: {dataset_path}")
+    digest = hashlib.sha256()
+    sample_count = 0
+    with dataset_path.open("rb") as handle:
+        for line_number, raw_line in enumerate(handle, start=1):
+            digest.update(raw_line)
+            if not raw_line.strip():
+                continue
+            sample_count += 1
+            if label_mode != "step_action":
+                continue
+            try:
+                sample = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    f"Invalid JSON in step_action training sample at {dataset_path}:{line_number}: {exc}"
+                ) from exc
+            if not isinstance(sample, dict):
+                raise ValueError(
+                    f"step_action training sample at {dataset_path}:{line_number} must be an object"
+                )
+            missing = [field for field in STEP_ACTION_REQUIRED_FIELDS if field not in sample]
+            if missing:
+                raise ValueError(
+                    f"step_action training sample at {dataset_path}:{line_number} "
+                    f"missing required fields: {', '.join(missing)}"
+                )
+    return digest.hexdigest(), sample_count
+
+
 def build_checkpoint_meta(args):
     manifest_path = Path(str(args.train_json) + ".manifest.json")
-    manifest = {}
-    manifest_hash = None
-    if manifest_path.exists():
-        raw = manifest_path.read_bytes()
-        manifest_hash = hashlib.sha256(raw).hexdigest()
-        manifest = json.loads(raw.decode("utf-8"))
-        if int(manifest.get("schema_version", -1)) != 1:
-            raise ValueError(f"Unsupported data manifest schema: {manifest_path}")
-    else:
-        print(
-            f"!!! [train_pfem] WARNING: no sidecar manifest at {manifest_path}; "
-            "using legacy absolute-label metadata defaults"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Training data manifest is required for content binding: {manifest_path}"
         )
+    raw = manifest_path.read_bytes()
+    manifest_hash = hashlib.sha256(raw).hexdigest()
+    manifest = json.loads(raw.decode("utf-8"))
+    if int(manifest.get("schema_version", -1)) != 1:
+        raise ValueError(f"Unsupported data manifest schema: {manifest_path}")
 
     fps = _single_manifest_value(manifest.get("fps", 10.0), "fps")
     dt = _single_manifest_value(manifest.get("dt", 1.0 / float(fps)), "dt")
@@ -105,6 +137,23 @@ def build_checkpoint_meta(args):
         "action_semantics",
     )
     delta_scale = _single_manifest_value(manifest.get("delta_scale", 1.0), "delta_scale")
+    expected_data_hash = manifest.get("data_jsonl_sha256")
+    expected_sample_count = manifest.get("sample_count")
+    if not isinstance(expected_data_hash, str) or not expected_data_hash:
+        raise ValueError(f"Data manifest missing data_jsonl_sha256: {manifest_path}")
+    if not isinstance(expected_sample_count, int) or expected_sample_count < 0:
+        raise ValueError(f"Data manifest missing valid sample_count: {manifest_path}")
+    data_jsonl_sha256, sample_count = inspect_training_jsonl(args.train_json, args.label_mode)
+    if data_jsonl_sha256 != expected_data_hash:
+        raise ValueError(
+            f"Training JSONL sha256 mismatch for {args.train_json}: "
+            f"manifest={expected_data_hash}, actual={data_jsonl_sha256}"
+        )
+    if sample_count != expected_sample_count:
+        raise ValueError(
+            f"Training JSONL sample_count mismatch for {args.train_json}: "
+            f"manifest={expected_sample_count}, actual={sample_count}"
+        )
     return {
         "schema_version": 1,
         "n_waypoints": int(args.n_waypoints),
@@ -117,6 +166,8 @@ def build_checkpoint_meta(args):
         "aux_delta_vel": bool(args.aux_delta_vel),
         "lambda_yaw": float(args.lambda_yaw),
         "data_manifest_hash": manifest_hash,
+        "data_jsonl_sha256": data_jsonl_sha256,
+        "sample_count": sample_count,
         "train_args": dict(vars(args)),
     }
 
@@ -203,7 +254,8 @@ def main():
         base = OpenTrackVLA(mcfg, vision_feat_dim=args.vision_feat_dim)
     base = base.to(device)
     # The official base checkpoint may be authoritative for n_waypoints.
-    checkpoint_meta = build_checkpoint_meta(args)
+    checkpoint_meta["n_waypoints"] = int(args.n_waypoints)
+    checkpoint_meta["train_args"] = dict(vars(args))
 
     # Wrap with PFEM-Harness
     model = PFEMHarness(

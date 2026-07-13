@@ -53,12 +53,12 @@ Fable 规划/验证/裁决（权重高）→ 主席团评审 → codex gpt-5.6-s
 - `--state_mode {stateless,rolling}` 默认 stateless（每帧 init_state，匹配训练）。rolling 保留但启动时打印"实验性，与训练分布不一致"警告。
 - 表述修正（codex）：这是 conditioned-stateless policy——PFEM latent 无状态，控制安全层（rate-limit/EMA/prev cmd）是控制器状态，两者不矛盾。
 
-### F4（P0）checkpoint 元数据（修订：警告优先，--force 覆写）
-- `train_pfem.py` checkpoint 增加 `meta = {schema_version:1, n_waypoints, history, dt, fps, label_mode, action_semantics, delta_scale, data_manifest_hash, train_args}`。
-- `mac_server.py` 读 meta 设置 dt/history/label_mode；CLI 显式传参与 meta 冲突时打印强警告并以 CLI 为准（Gemini：允许降级执行）。
+### F4（P0）checkpoint 元数据（最终：缺失即 fail-closed）
+- `train_pfem.py` checkpoint 写入 `meta = {schema_version:1, n_waypoints, history, dt, fps, label_mode, action_semantics, delta_scale, data_manifest_hash, data_jsonl_sha256, sample_count, train_args}`。
+- `mac_server.py` 读 meta 设置 dt/history/label_mode；非 mock 模式下 checkpoint 缺 meta，或 meta 缺 schema_version/label_mode/history/dt 任一字段，均拒绝启动，不再默认 absolute。显式 CLI 冲突仍打印强警告并以 CLI 为准。
 
 ### F5（P1）云台防漂移
-- invalid_pred 或 C<stop_confidence 时不更新 pan；|theta|<2° 死区；回中速率按**秒**计（`--pan_recenter_per_s`，默认 30 PWM/s，0 关闭）。
+- invalid_pred 或 C<stop_confidence 时不更新 pan；`--pan_deadzone_deg` 默认 4°，可覆盖 Polar 60-bin 解码的最小非零中心角 ±3°；回中速率按**秒**计（`--pan_recenter_per_s`，默认 30 PWM/s，0 关闭）。
 
 ### F6（P1）共享运动学 + 修 off-by-one
 - 新建 `data_pipeline/kinematics.py`：`integrate_actions(actions, dt) -> waypoints`，语义 `waypoint[k] = compose(action[0..k])`（8 个 action 全用），
@@ -68,23 +68,24 @@ Fable 规划/验证/裁决（权重高）→ 主席团评审 → codex gpt-5.6-s
 
 ### F7（P1）路径可移植 + sidecar manifest
 - JSONL 默认写 repo-root 相对路径（保留 --absolute_paths）。
-- 数据集元数据写 **sidecar** `<output>.manifest.json`（含 path_root, fps, dt, action_semantics, label_mode, schema_version, 统计信息）——
+- 数据集元数据写 **sidecar** `<output>.manifest.json`（含 path_root, fps, dt, action_semantics, label_mode, schema_version、JSONL SHA-256、行数与统计信息）——
   **不写 JSONL 首行**（dataset 把每行当样本，会崩）。dataset 加载时若发现同名 manifest 则读取并校验。
 
 ### F8（P0 升级）数据完整性 + 杂项
 - builder 遇到空/坏 meta、空 episode.json、时间戳间隔 p95/p50>1.2、未知语义时：**默认报错退出**（--lenient 降级为警告），
   输出每 episode 的完整性报告（test006 已知有空 episode.json 和 127 个空 meta）。
+- builder 写出后用 `training_sample.schema.json` 校验首样本与随机 3 个样本；train_pfem 强制核对 JSONL SHA-256/行数，step_action 数据缺 step_actions/prev_action/delta_vel 任一字段即拒训，不提供 lenient 降级。
 - `data_pipeline/dataset_stats.py`：command/transition_type 分布、Polar 有效率、fps 一致性、delta 值域统计。
 - train_pfem 设备选择 cuda>mps>cpu；移除 --lora 死参数；compute_losses 用 valid_mask；requirements.txt 加 pytest（并给关键包加下限版本）。
 
 ### F9（P0 新增）伪标签质量：Haar 正脸 → OmDet-Turbo 行人检测
 - `build_training_data.py` 的 `estimate_target_from_frame` 改为优先用 OmDet-Turbo（复用 model.py:388 `_get_bbox_detector` 的加载方式，
   提成共享模块 `data_pipeline/target_detector.py`），检测 "person"，取最高分框；模型不可用时回退 Haar 并醒目警告。
-- 距离仍为启发式（bbox 高度），但在 manifest 中标注 `distance_source: heuristic_bbox`。
+- 距离仍为启发式，并按检测来源区分：OmDet 使用完整行人框高度，Haar 回退使用人脸框纵向位置；manifest 标注 `distance_source: source_aware_heuristic` 与分来源规则。
 - 目标：Polar 有效率从 25.6% 显著提升；构建报告输出前后对比。
 
 ### F10（P0 新增）checkpoint fail-closed
-- 非 mock 模式下：PFEM ckpt 不存在 → **拒绝启动**；控制关键模块（delta/step 头、context_proj、cot、proj）的 key 缺失 → 拒绝启动并列出缺失；
+- 非 mock 模式下：PFEM ckpt 不存在、meta 缺失/不完整、或控制关键模块（delta/step 头、context_proj、cot、proj）的 key 缺失 → **拒绝启动**并列出原因；
   `--allow_random_init` 仅在配合 `--shadow_mode`（只打印命令不发 motors，见 F11）时允许。
 - base.llm.* 缺失仍容忍（Qwen 独立加载）。
 
