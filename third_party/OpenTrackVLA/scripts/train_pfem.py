@@ -17,17 +17,18 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from safetensors.torch import load_file as load_safetensors
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from model import OpenTrackVLA, ModelConfig, JsonTrackingDataset, DataConfig, collate_batch
 from harness.harness_wrapper import PFEMHarness
+from harness.core.event_sampling import compute_event_sampling_weights, weighted_event_fraction
 from local_weights import default_qwen_candidates, resolve_local_model_path
 
 
-def parse_args():
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--train_json", required=True)
     ap.add_argument("--epochs", type=int, default=1)
@@ -37,6 +38,15 @@ def parse_args():
     ap.add_argument("--vision_feat_dim", type=int, default=1536)
     ap.add_argument("--history", type=int, default=31)
     ap.add_argument("--n_waypoints", type=int, default=8)
+    ap.add_argument("--label_mode", choices=("absolute", "step_action"), default=None)
+    ap.add_argument("--lambda_yaw", type=float, default=2.0)
+    ap.add_argument("--aux_delta_vel", action="store_true")
+    ap.add_argument(
+        "--balance_sampling",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use transition-event stratified sampling (default: enabled).",
+    )
     ap.add_argument("--cache_root", type=str, default=None)
     ap.add_argument(
         "--base_hf_model_dir",
@@ -46,7 +56,12 @@ def parse_args():
     )
     ap.add_argument("--qwen_model_path", type=str, default=None,
                     help="Optional local Qwen/Qwen3-0.6B directory for offline training.")
-    return ap.parse_args()
+    args = ap.parse_args(argv)
+    if args.lambda_yaw < 0:
+        ap.error("--lambda_yaw must be >= 0")
+    if args.aux_delta_vel and args.label_mode == "absolute":
+        ap.error("--aux_delta_vel requires --label_mode step_action")
+    return args
 
 
 def _single_manifest_value(value, field):
@@ -76,7 +91,15 @@ def build_checkpoint_meta(args):
 
     fps = _single_manifest_value(manifest.get("fps", 10.0), "fps")
     dt = _single_manifest_value(manifest.get("dt", 1.0 / float(fps)), "dt")
-    label_mode = _single_manifest_value(manifest.get("label_mode", "absolute"), "label_mode")
+    manifest_label_mode = _single_manifest_value(manifest.get("label_mode", "absolute"), "label_mode")
+    if args.label_mode is not None and str(args.label_mode) != str(manifest_label_mode):
+        raise ValueError(
+            f"--label_mode={args.label_mode} conflicts with manifest label_mode={manifest_label_mode}"
+        )
+    label_mode = args.label_mode or manifest_label_mode
+    args.label_mode = str(label_mode)
+    if args.aux_delta_vel and args.label_mode != "step_action":
+        raise ValueError("--aux_delta_vel requires step_action labels")
     action_semantics = _single_manifest_value(
         manifest.get("action_semantics", "unknown_legacy"),
         "action_semantics",
@@ -91,9 +114,42 @@ def build_checkpoint_meta(args):
         "label_mode": str(label_mode),
         "action_semantics": str(action_semantics),
         "delta_scale": float(delta_scale),
+        "aux_delta_vel": bool(args.aux_delta_vel),
+        "lambda_yaw": float(args.lambda_yaw),
         "data_manifest_hash": manifest_hash,
         "train_args": dict(vars(args)),
     }
+
+
+def build_training_sampler(dataset, enabled=True):
+    if not enabled:
+        return None
+    transition_types = [
+        dataset.get_example(index).get("transition_type", "other")
+        for index in range(len(dataset))
+    ]
+    weights = compute_event_sampling_weights(transition_types)
+    if not weights:
+        return None
+    if all(abs(float(weight) - 1.0) < 1e-12 for weight in weights):
+        print("[train_pfem] balanced sampling: dataset already meets the event target")
+        return None
+    event_fraction = weighted_event_fraction(transition_types, weights)
+    max_weight = max(weights)
+    print(
+        f"[train_pfem] balanced sampling: expected_event_fraction={event_fraction:.3f} "
+        f"max_weight={max_weight:.2f}"
+    )
+    if event_fraction < 0.4:
+        print(
+            "!!! [train_pfem] WARNING: the 10x sampling cap prevents the current dataset "
+            "from reaching the 40% event target"
+        )
+    return WeightedRandomSampler(
+        torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+    )
 
 
 def main():
@@ -114,6 +170,8 @@ def main():
     else:
         device = torch.device("cpu")
     print(f"[train_pfem] device={device}")
+
+    checkpoint_meta = build_checkpoint_meta(args)
 
     # Build base model (frozen LLM). Prefer the official OpenTrackVLA checkpoint
     # when provided, instead of starting from a bare Qwen backbone.
@@ -144,9 +202,17 @@ def main():
         )
         base = OpenTrackVLA(mcfg, vision_feat_dim=args.vision_feat_dim)
     base = base.to(device)
+    # The official base checkpoint may be authoritative for n_waypoints.
+    checkpoint_meta = build_checkpoint_meta(args)
 
     # Wrap with PFEM-Harness
-    model = PFEMHarness(base).to(device)
+    model = PFEMHarness(
+        base,
+        label_mode=args.label_mode,
+        dt=checkpoint_meta["dt"],
+        lambda_yaw=args.lambda_yaw,
+        aux_delta_vel=args.aux_delta_vel,
+    ).to(device)
 
     # Count params
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -160,9 +226,15 @@ def main():
         history=args.history,
         cache_root=args.cache_root,
     ))
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        num_workers=0, collate_fn=collate_batch)
-    checkpoint_meta = build_checkpoint_meta(args)
+    sampler = build_training_sampler(ds, args.balance_sampling)
+    loader = DataLoader(
+        ds,
+        batch_size=args.batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        num_workers=0,
+        collate_fn=collate_batch,
+    )
 
     optim = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -185,11 +257,14 @@ def main():
                 fine_tidx=batch["fine_tidx"],
                 instructions=batch["instruction"],
                 prev_state=state,
+                prev_action=batch["prev_action"].to(device),
             )
 
             # Build GT dict from batch
             gt = {
                 "waypoints": batch["waypoints"].to(device),
+                "step_actions": batch["step_actions"].to(device),
+                "delta_vel": batch["delta_vel"].to(device),
                 "theta_idx": torch.zeros(B, dtype=torch.long, device=device),
                 "dist_idx": torch.zeros(B, dtype=torch.long, device=device),
                 "invalid": torch.zeros(B, device=device),

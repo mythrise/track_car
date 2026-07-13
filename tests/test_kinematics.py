@@ -1,6 +1,7 @@
 import math
 
 import numpy as np
+import torch
 
 from data_pipeline.kinematics import integrate_actions
 
@@ -33,3 +34,17 @@ def test_mirror_round_trip():
     round_trip = mirrored_actions.copy()
     round_trip[:, 1:] *= -1
     np.testing.assert_allclose(round_trip, actions, atol=0.0)
+
+
+def test_torch_integration_matches_numpy_and_keeps_gradients():
+    actions = torch.tensor(
+        [[[0.5, 0.0, 0.4], [0.7, 0.0, -0.2]]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    trajectory = integrate_actions(actions, dt=0.1)
+    expected = integrate_actions(actions.detach().numpy()[0], dt=0.1)
+    np.testing.assert_allclose(trajectory.detach().numpy()[0], expected, atol=1e-6)
+    trajectory.sum().backward()
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()

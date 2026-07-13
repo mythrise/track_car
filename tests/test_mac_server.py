@@ -48,6 +48,8 @@ def test_ws1_cli_defaults_match_plan():
     assert args.invalid_stop_frames == 5
     assert args.max_waypoint_abs == 2.0
     assert args.pan_recenter_per_s == 30.0
+    assert args.max_action_rate == 4.0
+    assert args.action_ema == 0.5
 
 
 def test_low_confidence_triggers_stop_reason():
@@ -236,4 +238,38 @@ def test_shadow_mode_never_sends_intended_motors():
 def test_safety_state_reset_clears_previous_action():
     state = {"last_action": [1.0, 0.0, 0.5], "extra": 1}
     mac_server.reset_safety_state(state)
+    assert state == {"last_action": [0.0, 0.0, 0.0]}
+
+
+def test_step_action_rate_limit_scales_with_elapsed_then_applies_ema():
+    filtered, rate_limited = mac_server.filter_step_action(
+        [1.0, 0.0, -1.0],
+        [0.0, 0.0, 0.0],
+        elapsed=0.1,
+        max_action_rate=2.0,
+        action_ema=0.5,
+    )
+    assert rate_limited == pytest.approx([0.2, 0.0, -0.2])
+    assert filtered == pytest.approx([0.1, 0.0, -0.1])
+
+
+def test_step_action_checkpoint_is_allowed_when_new_head_is_present():
+    state = {
+        "context_proj.weight": object(),
+        "cot.theta_head.weight": object(),
+        "base.proj.net.0.weight": object(),
+        "step_action_head.trunk.0.weight": object(),
+    }
+    assert mac_server.missing_critical_checkpoint_keys(state, "step_action") == []
+    assert mac_server.missing_critical_checkpoint_keys(state, "step_action", True) == [
+        "prev_action_embed."
+    ]
+
+
+def test_invalid_prediction_clears_safety_memory_without_committing_action():
+    state = {"last_action": [0.8, 0.0, 0.4]}
+    committed = mac_server.commit_safety_state(
+        state, [0.9, 0.0, 0.5], invalid_pred=True
+    )
+    assert committed is False
     assert state == {"last_action": [0.0, 0.0, 0.0]}

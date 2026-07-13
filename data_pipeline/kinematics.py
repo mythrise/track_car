@@ -23,6 +23,16 @@ def integrate_actions(actions, dt: float) -> np.ndarray:
     if not np.isfinite(step_dt) or step_dt <= 0:
         raise ValueError("dt must be a finite positive number")
 
+    # Keep the shared implementation differentiable when it is used by the
+    # step-action training head.  The numpy path remains the public data
+    # pipeline behavior used by the builder and existing callers.
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - torch is a training dependency
+        torch = None
+    if torch is not None and isinstance(actions, torch.Tensor):
+        return _integrate_actions_torch(actions, step_dt)
+
     arr = np.asarray(actions, dtype=np.float32)
     if arr.ndim == 1:
         arr = arr[None, :]
@@ -50,3 +60,33 @@ def integrate_actions(actions, dt: float) -> np.ndarray:
         waypoints[index] = (x, y, yaw)
 
     return waypoints
+
+
+def _integrate_actions_torch(actions, dt: float):
+    import torch
+
+    arr = actions
+    squeeze_batch = False
+    if arr.dim() == 2:
+        arr = arr.unsqueeze(0)
+        squeeze_batch = True
+    if arr.dim() != 3 or arr.size(-1) < 1:
+        raise ValueError("actions must have shape (T, D) or (B, T, D) with D >= 1")
+    if arr.size(1) == 0:
+        result = arr.new_zeros((arr.size(0), 0, 3))
+        return result[0] if squeeze_batch else result
+    forward = arr[..., 0]
+    strafe = arr[..., 1] if arr.size(-1) > 1 else torch.zeros_like(forward)
+    yaw_rate = arr[..., 2] if arr.size(-1) > 2 else torch.zeros_like(forward)
+    yaw_delta = yaw_rate * dt
+    yaw = torch.cumsum(yaw_delta, dim=1)
+    yaw_before = yaw - yaw_delta
+    cos_yaw = torch.cos(yaw_before)
+    sin_yaw = torch.sin(yaw_before)
+    dx = (cos_yaw * forward - sin_yaw * strafe) * dt
+    dy = (sin_yaw * forward + cos_yaw * strafe) * dt
+    result = torch.stack(
+        (torch.cumsum(dx, dim=1), torch.cumsum(dy, dim=1), yaw),
+        dim=-1,
+    )
+    return result[0] if squeeze_batch else result

@@ -29,6 +29,7 @@ from data_pipeline.target_detector import get_default_target_detector
 
 
 SUPPORTED_ACTION_SEMANTICS = {"spin_v1", "arc_turn_v2"}
+TURN_THRESHOLD = 0.2
 
 
 class DataIntegrityError(RuntimeError):
@@ -81,7 +82,11 @@ def meta_to_action(meta):
             return None
     except (TypeError, ValueError, IndexError):
         return None
-    if len(action) != 3 or not all(math.isfinite(value) for value in action):
+    if (
+        len(action) != 3
+        or not all(math.isfinite(value) for value in action)
+        or any(abs(value) > 1.000001 for value in action)
+    ):
         return None
     return action
 
@@ -104,6 +109,138 @@ def integrate_waypoints(ep_dir, start_idx, horizon, fps):
             return None, None
         actions.append(action)
     return integrate_actions(actions, dt).tolist(), actions
+
+
+def derive_step_labels(actions, prev_action, dt):
+    step_actions = np.asarray(actions, dtype=np.float32)
+    previous = np.asarray(prev_action, dtype=np.float32)
+    if step_actions.ndim != 2 or step_actions.shape[1] != 3:
+        raise ValueError("actions must have shape (T, 3)")
+    if previous.shape != (3,):
+        raise ValueError("prev_action must have shape (3,)")
+    delta_pos = step_actions * float(dt)
+    prior = np.concatenate((previous[None, :], step_actions[:-1]), axis=0)
+    delta_vel = step_actions - prior
+    return step_actions.tolist(), delta_pos.tolist(), delta_vel.tolist()
+
+
+def classify_transition_type(prev_action, step_actions, threshold=TURN_THRESHOLD):
+    previous_yaw = float(prev_action[2])
+    yaws = np.asarray(step_actions, dtype=np.float32)[:, 2]
+    active = np.abs(yaws) > float(threshold)
+    previous_active = abs(previous_yaw) > float(threshold)
+
+    if not previous_active and not bool(active.any()):
+        return "steady_forward"
+
+    active_signs = np.sign(yaws[active])
+    sign_changed = len(set(active_signs.tolist())) > 1
+    if previous_active and active_signs.size:
+        sign_changed = sign_changed or bool(np.any(active_signs != np.sign(previous_yaw)))
+    transitions = int(np.count_nonzero(active[1:] != active[:-1])) if active.size > 1 else 0
+
+    if not previous_active:
+        if bool(active[-1]) and transitions <= 1 and not sign_changed:
+            return "turn_onset"
+        return "other"
+    if bool(active.all()) and not sign_changed:
+        return "sustained_turn"
+    if not bool(active[-1]) and transitions <= 1 and not sign_changed:
+        return "turn_exit"
+    return "other"
+
+
+def contains_turn(step_actions, prev_action=None, threshold=TURN_THRESHOLD):
+    previous_turn = (
+        prev_action is not None and abs(float(prev_action[2])) > float(threshold)
+    )
+    return previous_turn or any(
+        abs(float(action[2])) > float(threshold) for action in step_actions
+    )
+
+
+def mirror_actions(actions):
+    mirrored = np.asarray(actions, dtype=np.float32).copy()
+    mirrored[..., 1:] *= -1.0
+    return mirrored.tolist()
+
+
+def mirror_command(command):
+    swaps = {
+        "turn_left": "turn_right",
+        "turn_right": "turn_left",
+        "strafe_left": "strafe_right",
+        "strafe_right": "strafe_left",
+    }
+    return swaps.get(command, command)
+
+
+def validation_output_path(output: Path) -> Path:
+    suffix = output.suffix or ".jsonl"
+    return output.with_name(f"{output.stem}.val{suffix}")
+
+
+def _write_mirrored_image(source: Path, destination: Path) -> None:
+    frame = cv2.imread(str(source))
+    if frame is None:
+        raise DataIntegrityError(f"cannot mirror unreadable image: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not cv2.imwrite(str(destination), cv2.flip(frame, 1)):
+        raise DataIntegrityError(f"failed to write mirrored image: {destination}")
+
+
+def _mirrored_path(source: Path, mirror_root: Path, input_root: Path) -> Path:
+    try:
+        relative = source.resolve().relative_to(input_root.resolve())
+    except ValueError:
+        relative = Path(source.parent.name) / source.name
+    return mirror_root / relative
+
+
+def make_mirrored_sample(
+    sample,
+    source_images,
+    mirror_root,
+    input_root,
+    args,
+    fps,
+    written_images=None,
+):
+    written_images = set() if written_images is None else written_images
+    mirrored_paths = []
+    for source in source_images:
+        destination = _mirrored_path(source, mirror_root, input_root)
+        if destination not in written_images:
+            _write_mirrored_image(source, destination)
+            written_images.add(destination)
+        mirrored_paths.append(serialize_image_path(destination, args.absolute_paths))
+
+    mirrored = dict(sample)
+    mirrored["images"] = mirrored_paths[:-1]
+    mirrored["current"] = mirrored_paths[-1]
+    mirrored["mirrored"] = True
+    mirrored["command"] = mirror_command(sample.get("command"))
+    mirrored["prev_action"] = mirror_actions([sample["prev_action"]])[0]
+    mirrored["step_actions"] = mirror_actions(sample["step_actions"])
+    mirrored["actions"] = mirrored["step_actions"]
+    mirrored["delta_pos"] = (
+        np.asarray(mirrored["step_actions"], dtype=np.float32) / float(fps)
+    ).tolist()
+    prior = np.asarray([mirrored["prev_action"]] + mirrored["step_actions"][:-1], dtype=np.float32)
+    mirrored["delta_vel"] = (
+        np.asarray(mirrored["step_actions"], dtype=np.float32) - prior
+    ).tolist()
+    mirrored["waypoints"] = integrate_actions(mirrored["step_actions"], 1.0 / float(fps)).tolist()
+    mirrored["transition_type"] = classify_transition_type(
+        mirrored["prev_action"], mirrored["step_actions"]
+    )
+    if "bbox" in mirrored:
+        x0, y0, x1, y1 = mirrored["bbox"]
+        mirrored["bbox"] = [1.0 - x1, y0, 1.0 - x0, y1]
+    theta_idx = int(mirrored.get("polar_theta_idx", -1))
+    if theta_idx >= 0:
+        mirrored["polar_theta_idx"] = (-theta_idx) % 60
+    return mirrored
 
 
 def estimate_target_from_frame(frame, detector=None):
@@ -301,7 +438,11 @@ def build_dataset(args, detector_factory=get_default_target_detector):
     if not input_root.is_dir():
         raise DataIntegrityError(f"input directory does not exist: {input_root}")
 
-    reports = [inspect_episode(path) for path in sorted(input_root.iterdir()) if path.is_dir()]
+    reports = [
+        inspect_episode(path)
+        for path in sorted(input_root.iterdir())
+        if path.is_dir() and not path.name.startswith(".")
+    ]
     for report in reports:
         print_integrity_report(report)
     integrity_errors = [
@@ -339,12 +480,18 @@ def build_dataset(args, detector_factory=get_default_target_detector):
         args.lenient,
     )
 
-    detector = detector_factory(device="cpu")
-    all_samples = []
-    command_counts = Counter()
-    total_haar_valid = 0
-    total_final_valid = 0
+    label_mode = getattr(args, "label_mode", "absolute")
+    mirror_augment = bool(getattr(args, "mirror_augment", False))
+    val_episodes = set(getattr(args, "val_episodes", ()) or ())
+    output = Path(args.output).expanduser()
+    val_output_arg = getattr(args, "val_output", None)
+    val_output = Path(val_output_arg).expanduser() if val_output_arg else validation_output_path(output)
+    mirror_root = output.resolve().parent / f".{output.stem}_mirrored_images"
 
+    detector = detector_factory(device="cpu")
+    split_samples = {"train": [], "val": []}
+    split_haar_valid = {"train": 0, "val": 0}
+    mirrored_images_written = set()
     for report in usable:
         ep_dir = report["episode_dir"]
         frames = report["frames"]
@@ -356,11 +503,11 @@ def build_dataset(args, detector_factory=get_default_target_detector):
         episode_haar_valid = 0
         episode_final_valid = 0
 
-        if len(frames) < args.history + args.n_waypoints + 1:
+        if len(frames) < args.history + args.n_waypoints:
             print(f"[build] {ep_dir.name}: only {len(frames)} frames; no samples")
             continue
 
-        for t in range(args.history, len(frames) - args.n_waypoints):
+        for t in range(args.history, len(frames) - args.n_waypoints + 1):
             current_frame_path = frames[t]
             frame_idx = _frame_index(current_frame_path)
             meta = report["valid_meta"].get(frame_idx)
@@ -399,6 +546,13 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             if waypoints is None:
                 skipped_bad_meta += 1
                 continue
+            prev_meta = report["valid_meta"].get(frame_idx - 1)
+            prev_action = meta_to_action(prev_meta)
+            if prev_action is None:
+                skipped_bad_meta += 1
+                continue
+            step_actions, delta_pos, delta_vel = derive_step_labels(actions, prev_action, 1.0 / fps)
+            transition_type = classify_transition_type(prev_action, step_actions)
             if haar_detection is not None:
                 episode_haar_valid += 1
             if detected is not None:
@@ -412,6 +566,13 @@ def build_dataset(args, detector_factory=get_default_target_detector):
                 "instruction": instruction,
                 "waypoints": waypoints,
                 "actions": actions,
+                "step_actions": step_actions,
+                "delta_pos": delta_pos,
+                "delta_vel": delta_vel,
+                "prev_action": prev_action,
+                "transition_type": transition_type,
+                "mirrored": False,
+                "action_semantics": report["action_semantics"],
                 "motors": meta.get("motors"),
                 "command": meta.get("command"),
                 "polar_theta_idx": theta_idx,
@@ -426,12 +587,30 @@ def build_dataset(args, detector_factory=get_default_target_detector):
                     cy + bbox_height / 2.0,
                 ]
 
-            all_samples.append(sample)
-            command_counts[str(meta.get("command"))] += 1
+            split = "val" if ep_dir.name in val_episodes else "train"
+            split_samples[split].append(sample)
+            if haar_detection is not None:
+                split_haar_valid[split] += 1
+            if mirror_augment and contains_turn(step_actions, prev_action):
+                source_images = [
+                    frames[t - args.history + index]
+                    for index in range(args.history)
+                ] + [current_frame_path]
+                split_samples[split].append(
+                    make_mirrored_sample(
+                        sample,
+                        source_images,
+                        mirror_root,
+                        input_root,
+                        args,
+                        fps,
+                        mirrored_images_written,
+                    )
+                )
+                if haar_detection is not None:
+                    split_haar_valid[split] += 1
             episode_samples += 1
 
-        total_haar_valid += episode_haar_valid
-        total_final_valid += episode_final_valid
         report["samples"] = episode_samples
         report["skipped_bad_meta"] = skipped_bad_meta
         report["haar_valid"] = episode_haar_valid
@@ -442,70 +621,116 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             f"final={episode_final_valid}"
         )
 
-    output = Path(args.output).expanduser()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as handle:
-        for sample in all_samples:
-            handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
-
-    output_parent = output.resolve().parent
-    path_root = os.path.relpath(PROJECT_ROOT.resolve(), output_parent)
-    manifest = {
-        "schema_version": 1,
-        "path_root": path_root,
-        "path_mode": "absolute" if args.absolute_paths else "repo_relative",
-        "fps": fps_value,
-        "dt": (1.0 / fps_value) if isinstance(fps_value, (int, float)) else [1.0 / value for value in fps_value],
-        "history": int(args.history),
-        "n_waypoints": int(args.n_waypoints),
-        "action_semantics": semantics_value,
-        "label_mode": "absolute",
-        "delta_scale": 1.0,
-        "distance_source": "heuristic_bbox",
-        "statistics": {
-            "sample_count": len(all_samples),
-            "episode_count": len(usable),
-            "command_distribution": dict(sorted(command_counts.items())),
-            "polar_valid": total_final_valid,
-            "polar_invalid": len(all_samples) - total_final_valid,
-            "polar_valid_rate": total_final_valid / max(1, len(all_samples)),
-            "haar_baseline_valid": total_haar_valid,
-            "haar_baseline_valid_rate": total_haar_valid / max(1, len(all_samples)),
-            "episode_reports": [
-                {
-                    key: report.get(key)
-                    for key in (
-                        "episode",
-                        "frame_count",
-                        "valid_meta_count",
-                        "empty_meta",
-                        "malformed_meta",
-                        "missing_meta",
-                        "timestamp_p50",
-                        "timestamp_p95",
-                        "timestamp_jitter_ratio",
-                        "fps",
-                        "action_semantics",
-                        "samples",
-                        "skipped_bad_meta",
-                        "haar_valid",
-                        "polar_valid",
-                    )
-                }
-                for report in reports
-            ],
-        },
-    }
-    manifest_path = manifest_path_for(output)
-    with manifest_path.open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
-
-    print(
-        f"[build_training_data] wrote {len(all_samples)} samples to {output}; "
-        f"manifest={manifest_path}; Polar valid Haar={total_haar_valid}/{max(1, len(all_samples))} "
-        f"final={total_final_valid}/{max(1, len(all_samples))}"
+    all_samples = split_samples["train"]
+    all_output_samples = split_samples["train"] + split_samples["val"]
+    spin_turn_samples = sum(
+        sample["action_semantics"] == "spin_v1"
+        and contains_turn(sample["step_actions"], sample["prev_action"])
+        for sample in all_output_samples
     )
+    if spin_turn_samples:
+        print(
+            "!!! [build_training_data] WARNING: spin_v1 turn samples are retained, but final "
+            "step-action gains depend on recollecting arc_turn_v2 data "
+            f"({spin_turn_samples} turn samples including mirrors)."
+        )
+
+    def build_manifest(samples, split_name, dataset_output):
+        output_parent = dataset_output.resolve().parent
+        path_root = os.path.relpath(PROJECT_ROOT.resolve(), output_parent)
+        split_commands = Counter(str(sample.get("command")) for sample in samples)
+        split_transitions = Counter(str(sample.get("transition_type")) for sample in samples)
+        split_polar_valid = sum(float(sample.get("polar_invalid", 1.0)) < 0.5 for sample in samples)
+        return {
+            "schema_version": 1,
+            "path_root": path_root,
+            "path_mode": "absolute" if args.absolute_paths else "repo_relative",
+            "fps": fps_value,
+            "dt": (
+                (1.0 / fps_value)
+                if isinstance(fps_value, (int, float))
+                else [1.0 / value for value in fps_value]
+            ),
+            "history": int(args.history),
+            "n_waypoints": int(args.n_waypoints),
+            "action_semantics": semantics_value,
+            "label_mode": label_mode,
+            "delta_scale": 1.0,
+            "distance_source": "heuristic_bbox",
+            "split": split_name,
+            "statistics": {
+                "sample_count": len(samples),
+                "episode_count": len({sample["episode"] for sample in samples}),
+                "mirrored_count": sum(bool(sample.get("mirrored")) for sample in samples),
+                "command_distribution": dict(sorted(split_commands.items())),
+                "transition_type_distribution": dict(sorted(split_transitions.items())),
+                "polar_valid": split_polar_valid,
+                "polar_invalid": len(samples) - split_polar_valid,
+                "polar_valid_rate": split_polar_valid / max(1, len(samples)),
+                "haar_baseline_valid": split_haar_valid[split_name],
+                "haar_baseline_valid_rate": split_haar_valid[split_name] / max(1, len(samples)),
+                "episode_reports": [
+                    {
+                        key: report.get(key)
+                        for key in (
+                            "episode",
+                            "frame_count",
+                            "valid_meta_count",
+                            "empty_meta",
+                            "malformed_meta",
+                            "missing_meta",
+                            "timestamp_p50",
+                            "timestamp_p95",
+                            "timestamp_jitter_ratio",
+                            "fps",
+                            "action_semantics",
+                            "samples",
+                            "skipped_bad_meta",
+                            "haar_valid",
+                            "polar_valid",
+                        )
+                    }
+                    for report in reports
+                ],
+            },
+        }
+
+    def write_split(dataset_output, samples, split_name):
+        dataset_output.parent.mkdir(parents=True, exist_ok=True)
+        with dataset_output.open("w", encoding="utf-8") as handle:
+            for sample in samples:
+                handle.write(json.dumps(sample, ensure_ascii=False) + "\n")
+        split_manifest = build_manifest(samples, split_name, dataset_output)
+        sidecar = manifest_path_for(dataset_output)
+        with sidecar.open("w", encoding="utf-8") as handle:
+            json.dump(split_manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        return split_manifest, sidecar
+
+    manifest, manifest_path = write_split(output, split_samples["train"], "train")
+    if val_episodes:
+        val_manifest, val_manifest_path = write_split(val_output, split_samples["val"], "val")
+        manifest["validation"] = {
+            "output": str(val_output),
+            "manifest": str(val_manifest_path),
+            "sample_count": val_manifest["statistics"]["sample_count"],
+            "episodes": sorted(val_episodes),
+        }
+        with manifest_path.open("w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+
+    output_haar_valid = sum(split_haar_valid.values())
+    output_polar_valid = sum(
+        float(sample.get("polar_invalid", 1.0)) < 0.5 for sample in all_output_samples
+    )
+    print(
+        f"[build_training_data] wrote {len(all_samples)} train samples to {output}; "
+        f"manifest={manifest_path}; Polar valid Haar={output_haar_valid}/{max(1, len(all_output_samples))} "
+        f"final={output_polar_valid}/{max(1, len(all_output_samples))}"
+    )
+    if val_episodes:
+        print(f"[build_training_data] wrote {len(split_samples['val'])} val samples to {val_output}")
     return all_samples, manifest
 
 
@@ -515,6 +740,20 @@ def parse_args(argv=None):
     parser.add_argument("--output", required=True)
     parser.add_argument("--history", type=int, default=31)
     parser.add_argument("--n_waypoints", type=int, default=8)
+    parser.add_argument("--label_mode", choices=("step_action", "absolute"), default="step_action")
+    parser.add_argument(
+        "--mirror_augment",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Horizontally mirror samples whose horizon contains a turn (default: enabled).",
+    )
+    parser.add_argument(
+        "--val_episodes",
+        nargs="*",
+        default=(),
+        help="Episode directory names to write only to the validation JSONL.",
+    )
+    parser.add_argument("--val_output", default=None, help="Validation JSONL path; defaults beside --output.")
     parser.add_argument(
         "--absolute_paths",
         action="store_true",

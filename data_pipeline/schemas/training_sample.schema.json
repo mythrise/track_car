@@ -30,6 +30,32 @@
         "maxItems": 3
       }
     },
+    "step_actions": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "items": {"type": "number", "minimum": -1, "maximum": 1},
+        "minItems": 3,
+        "maxItems": 3
+      }
+    },
+    "delta_pos": {
+      "type": "array",
+      "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}
+    },
+    "delta_vel": {
+      "type": "array",
+      "items": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3}
+    },
+    "prev_action": {
+      "type": "array",
+      "items": {"type": "number", "minimum": -1, "maximum": 1},
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "transition_type": {"enum": ["steady_forward", "turn_onset", "sustained_turn", "turn_exit", "other"]},
+    "mirrored": {"type": "boolean"},
+    "action_semantics": {"enum": ["spin_v1", "arc_turn_v2"]},
     "motors": {
       "type": ["array", "null"],
       "items": {"type": "integer"}

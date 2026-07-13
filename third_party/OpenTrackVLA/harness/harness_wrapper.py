@@ -19,16 +19,33 @@ from harness.core.future_module import FutureModule
 from harness.core.verifier import Verifier
 from harness.core.event_bank import CognitiveEventBank, EVENT_TYPES
 from harness.core.orchestrator import Orchestrator
+from harness.core.step_planner import (
+    DeltaVelocityHead,
+    StepActionHead,
+    step_action_track_loss,
+)
+
+from data_pipeline.kinematics import integrate_actions
 
 
 class PFEMHarness(nn.Module):
     """Full PFEM-Harness wrapper around a frozen OpenTrackVLA base."""
 
-    def __init__(self, base_model: nn.Module, sig_dim: int = 8):
+    def __init__(self, base_model: nn.Module, sig_dim: int = 8, *,
+                 label_mode: str = "absolute", dt: float = 0.1,
+                 lambda_yaw: float = 2.0, aux_delta_vel: bool = False):
         super().__init__()
+        if label_mode not in {"absolute", "step_action"}:
+            raise ValueError(f"unsupported label_mode={label_mode!r}")
+        if float(dt) <= 0:
+            raise ValueError("dt must be > 0")
         self.base = base_model
         D = base_model.D
         self.D = D
+        self.label_mode = label_mode
+        self.dt = float(dt)
+        self.lambda_yaw = float(lambda_yaw)
+        self.aux_delta_vel = bool(aux_delta_vel)
 
         # Layer A
         self.cot = PolarCoTHead(D)
@@ -42,7 +59,14 @@ class PFEMHarness(nn.Module):
 
         # Context projection: D * 7 components → D for action head input
         ctx_dim = D * 7
+        if self.aux_delta_vel:
+            self.prev_action_embed = nn.Linear(3, 64)
+            ctx_dim += 64
         self.context_proj = nn.Linear(ctx_dim, D)
+        if self.label_mode == "step_action":
+            self.step_action_head = StepActionHead(D, base_model.cfg.n_waypoints)
+        if self.aux_delta_vel:
+            self.delta_vel_head = DeltaVelocityHead(D, base_model.cfg.n_waypoints)
 
         # Uncertainty weighting (Kendall et al.)
         self.log_sigma = nn.Parameter(torch.zeros(5))
@@ -59,9 +83,29 @@ class PFEMHarness(nn.Module):
             "last_action": torch.zeros(B, 3, device=device),
         }
 
+    def _condition_prev_action(self, prev_action):
+        conditioning = prev_action.to(dtype=torch.float32)
+        if self.training:
+            conditioning = conditioning + 0.05 * torch.randn_like(conditioning)
+        return self.prev_action_embed(conditioning)
+
+    def _predict_tracking(self, ctx, q_write, orch_out, delta):
+        if self.label_mode == "step_action":
+            step_actions = self.step_action_head(ctx)
+            return integrate_actions(step_actions, self.dt), step_actions
+
+        wp = self.base.planner(ctx)
+        tau_pred = wp * self.base.alpha_task
+        if not self.training:
+            gate = Verifier.runtime_gate(q_write, orch_out["mode"])
+            tau_pred = tau_pred + gate.unsqueeze(-1).unsqueeze(-1) * orch_out[
+                "alpha_verify"
+            ].unsqueeze(-1).unsqueeze(-1) * delta
+        return tau_pred, None
+
     def forward_step(self, coarse_tokens, coarse_tidx, fine_tokens, fine_tidx,
                      instructions, prev_state, distractor_rate=None,
-                     yaw_hist=None, yaw_curr=None):
+                     yaw_hist=None, yaw_curr=None, prev_action=None):
         """Single timestep forward through the full harness."""
         device = next(self.parameters()).device
         B = coarse_tokens.size(0)
@@ -152,23 +196,27 @@ class PFEMHarness(nn.Module):
             orch_out["mode_emb"],
             orch_out["meta_tokens"].mean(dim=1),
         ]
+        conditioning_prev_action = prev_state["last_action"] if prev_action is None else prev_action
+        conditioning_prev_action = conditioning_prev_action.to(device=device, dtype=torch.float32)
+        if self.aux_delta_vel:
+            ctx_parts.append(self._condition_prev_action(conditioning_prev_action))
         ctx = self.context_proj(torch.cat(ctx_parts, dim=-1))
 
-        # ---- Action head (reuse base planner) ----
-        wp = self.base.planner(ctx)
-        tau_pred = wp * self.base.alpha_task
+        # ---- Action head ----
+        tau_pred, step_actions = self._predict_tracking(ctx, q_write, orch_out, delta)
 
-        # Apply delta residual (state-triggered at inference)
-        if not self.training:
-            gate = Verifier.runtime_gate(q_write, orch_out["mode"])
-            tau_pred = tau_pred + gate.unsqueeze(-1).unsqueeze(-1) * orch_out["alpha_verify"].unsqueeze(-1).unsqueeze(-1) * delta
+        delta_vel_pred = self.delta_vel_head(ctx) if self.aux_delta_vel else None
 
         new_state = {
             "tim": tim_state,
             "evt": evt_state,
-            "last_action": tau_pred[:, 0].detach() if tau_pred.dim() == 3 else torch.zeros(B, 3, device=device),
+            "last_action": (
+                step_actions[:, 0].detach()
+                if step_actions is not None
+                else tau_pred[:, 0].detach()
+            ),
         }
-        return {
+        result = {
             "waypoints": tau_pred,
             "cot": cot_out,
             "cot_decoded": cot_decoded,
@@ -179,24 +227,42 @@ class PFEMHarness(nn.Module):
             "orch": orch_out,
             "new_state": new_state,
         }
+        if step_actions is not None:
+            result["step_actions"] = step_actions
+        if delta_vel_pred is not None:
+            result["delta_vel"] = delta_vel_pred
+        return result
 
     def compute_losses(self, out: dict, gt: dict) -> dict:
         """Compute all PFEM losses with Uncertainty Weighting."""
         L_cot = polar_cot_loss(out["cot"], gt["theta_idx"], gt["dist_idx"], gt["invalid"])
-        track_error = F.mse_loss(out["waypoints"], gt["waypoints"], reduction="none")
         valid_mask = gt.get("valid_mask")
-        if valid_mask is None:
-            L_track = track_error.mean()
+        if self.label_mode == "step_action":
+            L_track, L_fwd, L_yaw, L_dvel = step_action_track_loss(
+                out["step_actions"],
+                gt["step_actions"],
+                valid_mask,
+                lambda_yaw=self.lambda_yaw,
+                pred_delta_vel=out.get("delta_vel"),
+                target_delta_vel=gt.get("delta_vel"),
+            )
         else:
-            mask = valid_mask.to(device=track_error.device, dtype=track_error.dtype)
-            while mask.dim() < track_error.dim():
-                mask = mask.unsqueeze(-1)
-            mask = mask.expand_as(track_error)
-            denominator = mask.sum()
-            if denominator.item() <= 0:
-                L_track = track_error.sum() * 0.0
+            track_error = F.mse_loss(out["waypoints"], gt["waypoints"], reduction="none")
+            if valid_mask is None:
+                L_track = track_error.mean()
             else:
-                L_track = (track_error * mask).sum() / denominator
+                mask = valid_mask.to(device=track_error.device, dtype=track_error.dtype)
+                while mask.dim() < track_error.dim():
+                    mask = mask.unsqueeze(-1)
+                mask = mask.expand_as(track_error)
+                denominator = mask.sum()
+                if denominator.item() <= 0:
+                    L_track = track_error.sum() * 0.0
+                else:
+                    L_track = (track_error * mask).sum() / denominator
+            L_fwd = L_track.new_zeros(())
+            L_yaw = L_track.new_zeros(())
+            L_dvel = L_track.new_zeros(())
 
         # Future loss (Δ=8 only for simplicity; expand for all horizons in full version)
         fut = out["future"]
@@ -218,6 +284,7 @@ class PFEMHarness(nn.Module):
         L = sum(0.5 * torch.exp(-self.log_sigma[i]) * losses[i] for i in range(5)) + 0.5 * self.log_sigma.sum()
         return {
             "loss": L, "L_track": L_track.item(), "L_cot": L_cot.item(),
+            "L_fwd": L_fwd.item(), "L_yaw": L_yaw.item(), "L_dvel": L_dvel.item(),
             "L_future": L_future.item() if L_future.requires_grad else 0.0,
             "L_verify": L_verify.item(),
         }

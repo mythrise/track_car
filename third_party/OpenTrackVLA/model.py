@@ -226,6 +226,7 @@ class ModelConfig:
     # Action/target configuration
     use_tanh_actions: bool = True
     alpha_xy: Optional[float] = None
+    default_dt: float = 0.1
 
 
 class OpenTrackVLA(nn.Module):
@@ -369,6 +370,7 @@ class JsonTrackingDataset(Dataset):
         manifests = [(source, load_dataset_manifest(source)) for source in manifest_sources]
         manifests = [(source, manifest) for source, manifest in manifests if manifest is not None]
         self.manifest = manifests[0][1] if len(manifests) == 1 else None
+        self.default_dt = float(cfg.default_dt)
         if self.manifest is not None and not isinstance(self.manifest['dt'], list):
             self.default_dt = float(self.manifest['dt'])
         if manifests:
@@ -592,6 +594,10 @@ class JsonTrackingDataset(Dataset):
         else:
             vm = torch.ones(self.cfg.n_waypoints, dtype=torch.bool)
 
+        raw_step_actions = ex.get('step_actions', ex.get('actions'))
+        if raw_step_actions is None:
+            raw_step_actions = np.zeros((self.cfg.n_waypoints, 3), dtype=np.float32)
+
         item: Dict[str, Any] = {
             'coarse_tokens': coarse_tokens,
             'coarse_tidx':   coarse_tidx,
@@ -600,6 +606,10 @@ class JsonTrackingDataset(Dataset):
             'yaw_hist':      yaw_hist,
             'yaw_curr':      yaw_curr,
             'waypoints':     wp,
+            'step_actions':  torch.tensor(raw_step_actions, dtype=torch.float32),
+            'delta_vel':     torch.tensor(ex.get('delta_vel', np.zeros((self.cfg.n_waypoints, 3))), dtype=torch.float32),
+            'prev_action':   torch.tensor(ex.get('prev_action', [0.0, 0.0, 0.0]), dtype=torch.float32),
+            'transition_type': str(ex.get('transition_type', 'other')),
             'valid_mask':    vm,
             'instruction':   ex.get('instruction', 'follow the person'),
             'current_path':  str(abs_curr_img),
@@ -672,6 +682,10 @@ def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'yaw_hist':      torch.stack([b['yaw_hist']      for b in batch], dim=0),
         'yaw_curr':      torch.stack([b['yaw_curr']      for b in batch], dim=0),
         'waypoints':     torch.stack([b['waypoints']     for b in batch], dim=0),
+        'step_actions':  torch.stack([b['step_actions']  for b in batch], dim=0),
+        'delta_vel':     torch.stack([b['delta_vel']     for b in batch], dim=0),
+        'prev_action':   torch.stack([b['prev_action']   for b in batch], dim=0),
+        'transition_type': [b['transition_type'] for b in batch],
         'valid_mask':    torch.stack([b['valid_mask']    for b in batch], dim=0),
         'instruction':   instr,
         'current_path':  [b['current_path'] for b in batch],

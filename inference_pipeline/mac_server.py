@@ -159,19 +159,32 @@ def load_official_base(base_hf_model_dir):
     return hf_model.model
 
 
-def critical_checkpoint_prefixes(label_mode: str):
+def critical_checkpoint_prefixes(label_mode: str, aux_delta_vel: bool = False):
     shared = ["context_proj.", "cot.", "base.proj."]
     if label_mode == "step_action":
-        return shared + ["step_action_head."]
+        prefixes = shared + ["step_action_head."]
+        if aux_delta_vel:
+            prefixes.append("prev_action_embed.")
+        return prefixes
     return shared + ["base.planner.", "verifier.delta_head."]
 
 
-def missing_critical_checkpoint_keys(model_state: dict, label_mode: str):
+def missing_critical_checkpoint_keys(model_state: dict, label_mode: str, aux_delta_vel: bool = False):
     keys = tuple(model_state)
-    return [prefix for prefix in critical_checkpoint_prefixes(label_mode) if not any(key.startswith(prefix) for key in keys)]
+    return [
+        prefix
+        for prefix in critical_checkpoint_prefixes(label_mode, aux_delta_vel)
+        if not any(key.startswith(prefix) for key in keys)
+    ]
 
 
-def enforce_checkpoint_policy(checkpoint, label_mode: str, allow_random_init: bool, shadow_mode: bool):
+def enforce_checkpoint_policy(
+    checkpoint,
+    label_mode: str,
+    allow_random_init: bool,
+    shadow_mode: bool,
+    aux_delta_vel: bool = False,
+):
     if allow_random_init and not shadow_mode:
         raise RuntimeError("--allow_random_init is only permitted together with --shadow_mode")
     if checkpoint is None:
@@ -181,9 +194,9 @@ def enforce_checkpoint_policy(checkpoint, label_mode: str, allow_random_init: bo
         raise FileNotFoundError("PFEM checkpoint is required in non-mock mode")
     model_state = checkpoint.get("model_state")
     if not isinstance(model_state, dict):
-        missing = ["model_state"] + critical_checkpoint_prefixes(label_mode)
+        missing = ["model_state"] + critical_checkpoint_prefixes(label_mode, aux_delta_vel)
     else:
-        missing = missing_critical_checkpoint_keys(model_state, label_mode)
+        missing = missing_critical_checkpoint_keys(model_state, label_mode, aux_delta_vel)
     if missing:
         message = "checkpoint is missing control-critical keys: " + ", ".join(missing)
         if allow_random_init and shadow_mode:
@@ -220,6 +233,18 @@ def apply_checkpoint_metadata(args, meta: dict | None, argv, warning_sink=print)
             setattr(args, attr, meta_value)
     if args.label_mode is None:
         args.label_mode = "absolute"
+    train_args = meta.get("train_args") if isinstance(meta.get("train_args"), dict) else {}
+    meta_aux = bool(meta.get("aux_delta_vel", train_args.get("aux_delta_vel", False)))
+    if _option_is_explicit(argv, "--aux_delta_vel") or _option_is_explicit(argv, "--no-aux_delta_vel"):
+        if getattr(args, "aux_delta_vel", None) != meta_aux:
+            warning_sink(
+                "!!! [server] CHECKPOINT META CONFLICT: auxiliary delta-velocity setting differs; "
+                "explicit CLI wins"
+            )
+    else:
+        args.aux_delta_vel = meta_aux
+    if getattr(args, "aux_delta_vel", None) is None:
+        args.aux_delta_vel = False
     args.checkpoint_meta = meta
     args.n_waypoints = int(meta.get("n_waypoints", 8))
     args.checkpoint_fps = meta.get("fps")
@@ -233,6 +258,8 @@ def load_model(
     base_hf_model_dir=None,
     n_waypoints=8,
     label_mode="absolute",
+    control_dt=0.1,
+    aux_delta_vel=False,
     allow_random_init=False,
 ):
     sys.path.insert(0, str(opentrackvla_root))
@@ -249,12 +276,12 @@ def load_model(
         )
         base = OpenTrackVLA(mcfg, vision_feat_dim=1536)
     base = base.to(device)
-    model = PFEMHarness(base).to(device).eval()
-    if label_mode == "step_action" and not hasattr(model, "step_action_head"):
-        raise RuntimeError(
-            "checkpoint label_mode=step_action is unsupported by the current WS1 harness; "
-            "refusing to drive until the WS2 step-action head is installed"
-        )
+    model = PFEMHarness(
+        base,
+        label_mode=label_mode,
+        dt=control_dt,
+        aux_delta_vel=aux_delta_vel,
+    ).to(device).eval()
     if checkpoint is not None:
         model_state = checkpoint.get("model_state", {})
         missing, unexpected = model.load_state_dict(model_state, strict=False)
@@ -262,7 +289,10 @@ def load_model(
         critical_missing = [
             key
             for key in missing
-            if any(key.startswith(prefix) for prefix in critical_checkpoint_prefixes(label_mode))
+            if any(
+                key.startswith(prefix)
+                for prefix in critical_checkpoint_prefixes(label_mode, aux_delta_vel)
+            )
         ]
         if critical_missing and not allow_random_init:
             raise RuntimeError(
@@ -374,6 +404,54 @@ def waypoint_to_action_command(waypoints, args):
     return motors, debug
 
 
+def filter_step_action(raw_action, previous_action, elapsed, max_action_rate, action_ema, max_abs=1.0):
+    raw = [clamp_float(value, -float(max_abs), float(max_abs)) for value in raw_action[:3]]
+    previous = [clamp_float(value, -float(max_abs), float(max_abs)) for value in previous_action[:3]]
+    max_delta = float(max_action_rate) * max(0.0, float(elapsed))
+    rate_limited = [
+        max(old - max_delta, min(old + max_delta, new))
+        for old, new in zip(previous, raw)
+    ]
+    smoothing = float(action_ema)
+    filtered = [
+        smoothing * old + (1.0 - smoothing) * new
+        for old, new in zip(previous, rate_limited)
+    ]
+    return filtered, rate_limited
+
+
+def step_action_to_action_command(step_actions, args, safety_state, elapsed):
+    if int(step_actions.shape[0]) <= 0:
+        raise RuntimeError("model returned no step actions")
+    raw_action = step_actions[0].detach().float().cpu().tolist()[:3]
+    previous_action = list(safety_state.get("last_action", [0.0, 0.0, 0.0]))
+    action, rate_limited = filter_step_action(
+        raw_action,
+        previous_action,
+        elapsed,
+        args.max_action_rate,
+        args.action_ema,
+        args.max_action_abs,
+    )
+    motors = waypoint_to_motor(action, scale=float(args.motor_scale))
+    if args.min_motor_delta > 0:
+        motors = boosted_motors(motors, args.min_motor_delta)
+    debug = {
+        "control_source": "step_action[0]",
+        "raw_action": raw_action,
+        "previous_action": previous_action,
+        "rate_limited_action": rate_limited,
+        "action": action,
+        "elapsed": float(elapsed),
+        "max_action_rate": float(args.max_action_rate),
+        "action_ema": float(args.action_ema),
+        "motor_scale": float(args.motor_scale),
+        "min_motor_delta": int(args.min_motor_delta),
+        "motor_delta": motor_delta(motors),
+    }
+    return motors, debug
+
+
 def _numeric_values(value):
     if hasattr(value, "detach"):
         value = value.detach().float().cpu().tolist()
@@ -453,6 +531,14 @@ def apply_shadow_output(intended_motors, debug):
 def reset_safety_state(state):
     state.clear()
     state["last_action"] = [0.0, 0.0, 0.0]
+
+
+def commit_safety_state(state, action, *, invalid_pred=False):
+    if invalid_pred:
+        reset_safety_state(state)
+        return False
+    state["last_action"] = list(action)
+    return True
 
 
 def default_device():
@@ -535,6 +621,11 @@ def handle_connection(conn, addr, args, model, encoder, device):
                     )
                     state = _initial_state_for_frame(model, args, rolling_state, batch_size, device)
                     with torch.inference_mode():
+                        previous_action = torch.tensor(
+                            [safety_state["last_action"]],
+                            dtype=torch.float32,
+                            device=device,
+                        )
                         output = model.forward_step(
                             coarse_tokens=coarse.to(device),
                             coarse_tidx=coarse_tidx.to(device),
@@ -542,11 +633,17 @@ def handle_connection(conn, addr, args, model, encoder, device):
                             fine_tidx=fine_tidx.to(device),
                             instructions=[instruction],
                             prev_state=state,
+                            prev_action=previous_action,
                         )
                     history_buffer.append_after_inference(coarse_frame)
                     rolling_state = output["new_state"] if args.state_mode == "rolling" else None
                     waypoints = output["waypoints"][0]
-                    intended_motors, debug = waypoint_to_action_command(waypoints, args)
+                    if args.label_mode == "step_action":
+                        intended_motors, debug = step_action_to_action_command(
+                            output["step_actions"][0], args, safety_state, elapsed
+                        )
+                    else:
+                        intended_motors, debug = waypoint_to_action_command(waypoints, args)
                     confidence = float(output["C"][0].item())
                     invalid_pred = _scalar_bool(output["cot_decoded"]["invalid_pred"][0])
                     invalid_streak = invalid_streak + 1 if invalid_pred else 0
@@ -583,7 +680,14 @@ def handle_connection(conn, addr, args, model, encoder, device):
                         if args.state_mode == "rolling":
                             rolling_state = None
                     else:
-                        safety_state["last_action"] = list(debug["action"])
+                        state_committed = commit_safety_state(
+                            safety_state,
+                            debug["action"],
+                            invalid_pred=invalid_pred,
+                        )
+                        if not state_committed:
+                            debug["safety_state_reset"] = True
+                            debug["safety_state_reset_reason"] = "invalid_pred"
 
                     if args.shadow_mode:
                         sent_motors, stop, debug = apply_shadow_output(intended_motors, debug)
@@ -662,11 +766,29 @@ def build_parser():
     parser.add_argument("--motor_scale", type=float, default=400.0)
     parser.add_argument("--min_motor_delta", type=int, default=0)
     parser.add_argument("--max_action_abs", type=float, default=1.0)
+    parser.add_argument(
+        "--max_action_rate",
+        type=float,
+        default=4.0,
+        help="Maximum per-axis action change per second in step_action mode.",
+    )
+    parser.add_argument(
+        "--action_ema",
+        type=float,
+        default=0.5,
+        help="Previous-command weight for step_action EMA smoothing.",
+    )
     parser.add_argument("--stop_confidence", type=float, default=0.3)
     parser.add_argument("--invalid_stop_frames", type=int, default=5)
     parser.add_argument("--max_waypoint_abs", type=float, default=2.0)
     parser.add_argument("--pan_recenter_per_s", type=float, default=30.0)
     parser.add_argument("--label_mode", choices=("absolute", "step_action"), default=None)
+    parser.add_argument(
+        "--aux_delta_vel",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override checkpoint auxiliary prev-action conditioning metadata.",
+    )
     parser.add_argument("--force", action="store_true", help="Acknowledge explicit CLI overrides of checkpoint metadata.")
     parser.add_argument("--allow_random_init", action="store_true")
     parser.add_argument("--shadow_mode", action="store_true")
@@ -687,6 +809,10 @@ def validate_args(parser, args):
         parser.error("--min_motor_delta must be >= 0")
     if args.max_action_abs <= 0:
         parser.error("--max_action_abs must be > 0")
+    if args.max_action_rate <= 0:
+        parser.error("--max_action_rate must be > 0")
+    if not 0.0 <= args.action_ema <= 1.0:
+        parser.error("--action_ema must be in [0, 1]")
     if not 0.0 <= args.stop_confidence <= 1.0:
         parser.error("--stop_confidence must be in [0, 1]")
     if args.invalid_stop_frames <= 0:
@@ -738,6 +864,7 @@ def main(argv=None):
             args.label_mode,
             args.allow_random_init,
             args.shadow_mode,
+            args.aux_delta_vel,
         )
         if not args.no_cleanup_port:
             cleanup_port(args.port, dry_run=False)
@@ -765,6 +892,8 @@ def main(argv=None):
             base_hf_model_dir=args.base_hf_model_dir,
             n_waypoints=args.n_waypoints,
             label_mode=args.label_mode,
+            control_dt=args.control_dt,
+            aux_delta_vel=args.aux_delta_vel,
             allow_random_init=args.allow_random_init,
         )
         encoder_device = "cuda" if device.type == "cuda" else "cpu"
