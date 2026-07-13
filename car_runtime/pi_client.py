@@ -60,6 +60,49 @@ def motor_direction(motors):
     return tuple(direction)
 
 
+def execute_motor_command(
+    hardware,
+    cmd,
+    *,
+    kick_speed,
+    kick_duration,
+    kick_repeat,
+    last_direction,
+    last_kick_time,
+    now=None,
+):
+    """Execute one server motor command, honoring ``stop`` before motors."""
+
+    if cmd.get("stop"):
+        hardware.stop()
+        neutral_direction = motor_direction([NEUTRAL, NEUTRAL, NEUTRAL, NEUTRAL])
+        return neutral_direction, last_kick_time
+
+    motors = cmd.get("motors", [NEUTRAL, NEUTRAL, NEUTRAL, NEUTRAL])
+    current_time = time.time() if now is None else float(now)
+    direction = motor_direction(motors)
+    bounded_kick_speed = max(0, min(int(kick_speed), MAX_SPEED))
+    bounded_kick_duration = max(0.0, min(float(kick_duration), 0.25))
+    direction_changed = direction != last_direction
+    repeat_due = kick_repeat > 0 and (current_time - last_kick_time) >= kick_repeat
+    should_kick = (
+        bounded_kick_speed > 0
+        and motor_delta(motors) > 0
+        and bounded_kick_duration > 0
+        and (direction_changed or repeat_due)
+    )
+    if should_kick:
+        hardware.run_motors_with_kick(
+            motors,
+            boosted_motors(motors, bounded_kick_speed),
+            bounded_kick_duration,
+        )
+        last_kick_time = current_time
+    else:
+        hardware.run_motors(motors)
+    return direction, last_kick_time
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--server_ip", default="192.168.12.100")
@@ -155,36 +198,21 @@ def main():
             if cmd is None:
                 break
 
-            # Execute motor command
-            motors = cmd.get("motors", [1500, 1500, 1500, 1500])
-            now = time.time()
-            direction = motor_direction(motors)
-            kick_speed = max(0, min(args.kick_speed, MAX_SPEED))
-            kick_duration = max(0.0, min(args.kick_duration, 0.25))
-            direction_changed = direction != last_direction
-            repeat_due = args.kick_repeat > 0 and (now - last_kick_time) >= args.kick_repeat
-            should_kick = (
-                kick_speed > 0
-                and motor_delta(motors) > 0
-                and kick_duration > 0
-                and (direction_changed or repeat_due)
+            last_direction, last_kick_time = execute_motor_command(
+                hardware,
+                cmd,
+                kick_speed=args.kick_speed,
+                kick_duration=args.kick_duration,
+                kick_repeat=args.kick_repeat,
+                last_direction=last_direction,
+                last_kick_time=last_kick_time,
             )
-            if should_kick:
-                hardware.run_motors_with_kick(motors, boosted_motors(motors, kick_speed), kick_duration)
-                last_kick_time = now
-            else:
-                hardware.run_motors(motors)
-            last_direction = direction
 
             # Execute pan-tilt
             if "pan" in cmd:
                 hardware.set_pan_pulse(int(cmd["pan"]))
             if "tilt" in cmd:
                 hardware.set_tilt_pulse(int(cmd["tilt"]))
-
-            # Safety: ultrasonic check (if available)
-            if cmd.get("stop"):
-                hardware.stop()
 
             frame_idx += 1
             if frame_idx % 30 == 0:

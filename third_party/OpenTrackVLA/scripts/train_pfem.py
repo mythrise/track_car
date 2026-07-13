@@ -4,12 +4,10 @@
 Usage:
     # Stage 1: train harness on pre-cached visual tokens
     python scripts/train_pfem.py --train_json data/tracking_train.jsonl --epochs 1
-
-    # Stage 2: LoRA finetune (add --lora)
-    python scripts/train_pfem.py --train_json data/tracking_train.jsonl --epochs 1 --lora
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -39,7 +37,6 @@ def parse_args():
     ap.add_argument("--vision_feat_dim", type=int, default=1536)
     ap.add_argument("--history", type=int, default=31)
     ap.add_argument("--n_waypoints", type=int, default=8)
-    ap.add_argument("--lora", action="store_true")
     ap.add_argument("--cache_root", type=str, default=None)
     ap.add_argument(
         "--base_hf_model_dir",
@@ -50,6 +47,53 @@ def parse_args():
     ap.add_argument("--qwen_model_path", type=str, default=None,
                     help="Optional local Qwen/Qwen3-0.6B directory for offline training.")
     return ap.parse_args()
+
+
+def _single_manifest_value(value, field):
+    if isinstance(value, list):
+        unique = list(dict.fromkeys(value))
+        if len(unique) != 1:
+            raise ValueError(f"Training requires one {field} value, got {unique}")
+        return unique[0]
+    return value
+
+
+def build_checkpoint_meta(args):
+    manifest_path = Path(str(args.train_json) + ".manifest.json")
+    manifest = {}
+    manifest_hash = None
+    if manifest_path.exists():
+        raw = manifest_path.read_bytes()
+        manifest_hash = hashlib.sha256(raw).hexdigest()
+        manifest = json.loads(raw.decode("utf-8"))
+        if int(manifest.get("schema_version", -1)) != 1:
+            raise ValueError(f"Unsupported data manifest schema: {manifest_path}")
+    else:
+        print(
+            f"!!! [train_pfem] WARNING: no sidecar manifest at {manifest_path}; "
+            "using legacy absolute-label metadata defaults"
+        )
+
+    fps = _single_manifest_value(manifest.get("fps", 10.0), "fps")
+    dt = _single_manifest_value(manifest.get("dt", 1.0 / float(fps)), "dt")
+    label_mode = _single_manifest_value(manifest.get("label_mode", "absolute"), "label_mode")
+    action_semantics = _single_manifest_value(
+        manifest.get("action_semantics", "unknown_legacy"),
+        "action_semantics",
+    )
+    delta_scale = _single_manifest_value(manifest.get("delta_scale", 1.0), "delta_scale")
+    return {
+        "schema_version": 1,
+        "n_waypoints": int(args.n_waypoints),
+        "history": int(args.history),
+        "dt": float(dt),
+        "fps": float(fps),
+        "label_mode": str(label_mode),
+        "action_semantics": str(action_semantics),
+        "delta_scale": float(delta_scale),
+        "data_manifest_hash": manifest_hash,
+        "train_args": dict(vars(args)),
+    }
 
 
 def main():
@@ -63,7 +107,12 @@ def main():
         env_var="QWEN_MODEL_PATH",
         candidates=default_qwen_candidates(),
     )
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"[train_pfem] device={device}")
 
     # Build base model (frozen LLM). Prefer the official OpenTrackVLA checkpoint
@@ -113,6 +162,7 @@ def main():
     ))
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
                         num_workers=0, collate_fn=collate_batch)
+    checkpoint_meta = build_checkpoint_meta(args)
 
     optim = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -143,6 +193,7 @@ def main():
                 "theta_idx": torch.zeros(B, dtype=torch.long, device=device),
                 "dist_idx": torch.zeros(B, dtype=torch.long, device=device),
                 "invalid": torch.zeros(B, device=device),
+                "valid_mask": batch["valid_mask"].to(device),
             }
             # If batch has polar labels, use them
             if "polar_theta_idx" in batch:
@@ -175,6 +226,7 @@ def main():
                            if not k.startswith("base.llm.")},
             "optimizer_state": optim.state_dict(),
             "loss": avg,
+            "meta": checkpoint_meta,
         }, ckpt_path)
         print(f"  saved {ckpt_path}")
 

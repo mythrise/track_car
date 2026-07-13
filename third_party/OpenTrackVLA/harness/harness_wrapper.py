@@ -183,7 +183,20 @@ class PFEMHarness(nn.Module):
     def compute_losses(self, out: dict, gt: dict) -> dict:
         """Compute all PFEM losses with Uncertainty Weighting."""
         L_cot = polar_cot_loss(out["cot"], gt["theta_idx"], gt["dist_idx"], gt["invalid"])
-        L_track = F.mse_loss(out["waypoints"], gt["waypoints"])
+        track_error = F.mse_loss(out["waypoints"], gt["waypoints"], reduction="none")
+        valid_mask = gt.get("valid_mask")
+        if valid_mask is None:
+            L_track = track_error.mean()
+        else:
+            mask = valid_mask.to(device=track_error.device, dtype=track_error.dtype)
+            while mask.dim() < track_error.dim():
+                mask = mask.unsqueeze(-1)
+            mask = mask.expand_as(track_error)
+            denominator = mask.sum()
+            if denominator.item() <= 0:
+                L_track = track_error.sum() * 0.0
+            else:
+                L_track = (track_error * mask).sum() / denominator
 
         # Future loss (Δ=8 only for simplicity; expand for all horizons in full version)
         fut = out["future"]

@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Mac inference server — receives frames from Pi, runs PFEM-Harness, sends commands.
+"""Mac inference server — receives Pi frames and returns safe commands."""
 
-Run on your Mac/PC:
-    python inference_pipeline/mac_server.py --port 9999
-"""
+from __future__ import annotations
 
 import argparse
+import math
 import os
 import socket
 import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "car_runtime"))
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BUNDLED_OPENTRACKVLA_ROOT = PROJECT_ROOT / "third_party" / "OpenTrackVLA"
+NEUTRAL_MOTORS = [1500, 1500, 1500, 1500]
+
+sys.path.insert(0, str(PROJECT_ROOT / "car_runtime"))
 try:
     from car_hardware import boosted_motors, command_from_key, motor_delta, waypoint_to_motor
     from car_protocol import recv_jpeg_frame, recv_json, send_json
@@ -24,8 +27,43 @@ except ImportError:
     from car_runtime.process_cleanup import cleanup_port
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BUNDLED_OPENTRACKVLA_ROOT = PROJECT_ROOT / "third_party" / "OpenTrackVLA"
+MOCK_KEYS = {
+    "stop": " ",
+    "forward": "w",
+    "backward": "s",
+    "turn_left": "a",
+    "turn_right": "d",
+    "strafe_left": "q",
+    "strafe_right": "e",
+}
+
+
+class CoarseHistoryBuffer:
+    """Keep prior-frame coarse features without training-distribution padding."""
+
+    def __init__(self, history: int, warmup_frames: int):
+        self.history = int(history)
+        self.warmup_frames = int(warmup_frames)
+        if self.history <= 0:
+            raise ValueError("history must be > 0")
+        if self.warmup_frames < self.history:
+            raise ValueError("warmup_frames must be >= history to avoid repeated-frame padding")
+        self._frames = []
+        self.seen_frames = 0
+
+    def ready_for_inference(self) -> bool:
+        return self.seen_frames >= self.warmup_frames and len(self._frames) == self.history
+
+    def frames_for_inference(self):
+        if not self.ready_for_inference():
+            raise RuntimeError("coarse history is not warmed up")
+        return list(self._frames)
+
+    def append_after_inference(self, coarse_frame) -> None:
+        self.seen_frames += 1
+        self._frames.append(coarse_frame)
+        if len(self._frames) > self.history:
+            self._frames = self._frames[-self.history :]
 
 
 def resolve_opentrackvla_root(root_arg):
@@ -48,9 +86,9 @@ def default_existing_path(*paths):
     for path in paths:
         if path is None:
             continue
-        p = Path(path).expanduser()
-        if p.exists():
-            return str(p.resolve())
+        candidate = Path(path).expanduser()
+        if candidate.exists():
+            return str(candidate.resolve())
     return None
 
 
@@ -91,6 +129,9 @@ def configure_default_weight_paths(args, opentrackvla_root):
     elif args.base_hf_model_dir:
         args.base_hf_model_dir = str(Path(args.base_hf_model_dir).expanduser().resolve())
 
+
+
+def configure_checkpoint_path(args, opentrackvla_root):
     if args.ckpt is None:
         args.ckpt = default_existing_path(
             opentrackvla_root / "ckpts_pfem" / "car_official_dinov3" / "pfem_epoch0.pt",
@@ -118,9 +159,82 @@ def load_official_base(base_hf_model_dir):
     return hf_model.model
 
 
-def load_model(ckpt_path, device, opentrackvla_root, base_hf_model_dir=None):
-    import torch
+def critical_checkpoint_prefixes(label_mode: str):
+    shared = ["context_proj.", "cot.", "base.proj."]
+    if label_mode == "step_action":
+        return shared + ["step_action_head."]
+    return shared + ["base.planner.", "verifier.delta_head."]
 
+
+def missing_critical_checkpoint_keys(model_state: dict, label_mode: str):
+    keys = tuple(model_state)
+    return [prefix for prefix in critical_checkpoint_prefixes(label_mode) if not any(key.startswith(prefix) for key in keys)]
+
+
+def enforce_checkpoint_policy(checkpoint, label_mode: str, allow_random_init: bool, shadow_mode: bool):
+    if allow_random_init and not shadow_mode:
+        raise RuntimeError("--allow_random_init is only permitted together with --shadow_mode")
+    if checkpoint is None:
+        if allow_random_init and shadow_mode:
+            print("!!! [server] WARNING: no PFEM checkpoint; random init allowed only because shadow mode is active")
+            return
+        raise FileNotFoundError("PFEM checkpoint is required in non-mock mode")
+    model_state = checkpoint.get("model_state")
+    if not isinstance(model_state, dict):
+        missing = ["model_state"] + critical_checkpoint_prefixes(label_mode)
+    else:
+        missing = missing_critical_checkpoint_keys(model_state, label_mode)
+    if missing:
+        message = "checkpoint is missing control-critical keys: " + ", ".join(missing)
+        if allow_random_init and shadow_mode:
+            print(f"!!! [server] WARNING: {message}; random values remain shadow-only")
+            return
+        raise RuntimeError(message)
+
+
+def _option_is_explicit(argv, option: str) -> bool:
+    return any(arg == option or arg.startswith(option + "=") for arg in argv)
+
+
+def apply_checkpoint_metadata(args, meta: dict | None, argv, warning_sink=print):
+    meta = meta if isinstance(meta, dict) else {}
+    mappings = (
+        ("--history", "history", "history", int),
+        ("--control_dt", "control_dt", "dt", float),
+        ("--label_mode", "label_mode", "label_mode", str),
+    )
+    for option, attr, meta_key, caster in mappings:
+        if meta_key not in meta or meta[meta_key] is None:
+            continue
+        meta_value = caster(meta[meta_key])
+        current = getattr(args, attr)
+        if _option_is_explicit(argv, option):
+            equal = math.isclose(float(current), float(meta_value)) if isinstance(meta_value, float) else current == meta_value
+            if not equal:
+                acknowledgement = " (--force acknowledged)" if getattr(args, "force", False) else ""
+                warning_sink(
+                    f"!!! [server] CHECKPOINT META CONFLICT: {option}={current!r}, "
+                    f"checkpoint {meta_key}={meta_value!r}; explicit CLI wins{acknowledgement}"
+                )
+        else:
+            setattr(args, attr, meta_value)
+    if args.label_mode is None:
+        args.label_mode = "absolute"
+    args.checkpoint_meta = meta
+    args.n_waypoints = int(meta.get("n_waypoints", 8))
+    args.checkpoint_fps = meta.get("fps")
+    return args
+
+
+def load_model(
+    checkpoint,
+    device,
+    opentrackvla_root,
+    base_hf_model_dir=None,
+    n_waypoints=8,
+    label_mode="absolute",
+    allow_random_init=False,
+):
     sys.path.insert(0, str(opentrackvla_root))
     from model import OpenTrackVLA, ModelConfig
     from harness.harness_wrapper import PFEMHarness
@@ -130,45 +244,57 @@ def load_model(ckpt_path, device, opentrackvla_root, base_hf_model_dir=None):
     else:
         mcfg = ModelConfig(
             llm_name=os.environ.get("QWEN_MODEL_PATH", "Qwen/Qwen3-0.6B"),
-            n_waypoints=8,
+            n_waypoints=int(n_waypoints),
             freeze_llm=True,
         )
         base = OpenTrackVLA(mcfg, vision_feat_dim=1536)
     base = base.to(device)
     model = PFEMHarness(base).to(device).eval()
-    if ckpt_path and Path(ckpt_path).exists():
-        ckpt = torch.load(ckpt_path, map_location=device)
-        msd = ckpt.get("model_state", {})
-        missing, unexpected = model.load_state_dict(msd, strict=False)
-        missing = [k for k in missing if not k.startswith("base.llm.")]
-        print(f"[server] loaded {ckpt_path}: {len(missing)} missing, {len(unexpected)} unexpected")
+    if label_mode == "step_action" and not hasattr(model, "step_action_head"):
+        raise RuntimeError(
+            "checkpoint label_mode=step_action is unsupported by the current WS1 harness; "
+            "refusing to drive until the WS2 step-action head is installed"
+        )
+    if checkpoint is not None:
+        model_state = checkpoint.get("model_state", {})
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        missing = [key for key in missing if not key.startswith("base.llm.")]
+        critical_missing = [
+            key
+            for key in missing
+            if any(key.startswith(prefix) for prefix in critical_checkpoint_prefixes(label_mode))
+        ]
+        if critical_missing and not allow_random_init:
+            raise RuntimeError(
+                "checkpoint load left control-critical parameters uninitialized: "
+                + ", ".join(critical_missing)
+            )
+        print(f"[server] loaded checkpoint: {len(missing)} missing, {len(unexpected)} unexpected")
     return model
 
 
 def encode_frame(frame, encoder):
-    import torch
     import cv2
+    import torch
     from PIL import Image
     from cache_gridpool import grid_pool_tokens
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(rgb).convert("RGB")
-    tok_dino, hp, wp = encoder._encode_dino([pil])
-    tok_sigl = encoder._encode_siglip([pil], out_hw=(hp, wp))
-    tokens = torch.cat([tok_dino, tok_sigl], dim=-1)
-    fine = grid_pool_tokens(tokens, hp, wp, out_tokens=64)[0].float()
-    coarse = grid_pool_tokens(tokens, hp, wp, out_tokens=4)[0].float()
+    image = Image.fromarray(rgb).convert("RGB")
+    tokens_dino, height_patches, width_patches = encoder._encode_dino([image])
+    tokens_siglip = encoder._encode_siglip([image], out_hw=(height_patches, width_patches))
+    tokens = torch.cat([tokens_dino, tokens_siglip], dim=-1)
+    fine = grid_pool_tokens(tokens, height_patches, width_patches, out_tokens=64)[0].float()
+    coarse = grid_pool_tokens(tokens, height_patches, width_patches, out_tokens=4)[0].float()
     return coarse, fine
 
 
 def build_tokens(coarse_history, fine_tokens, history):
     import torch
 
-    frames = list(coarse_history[-history:])
-    if not frames:
-        raise RuntimeError("empty coarse history")
-    while len(frames) < history:
-        frames.insert(0, frames[0])
+    frames = list(coarse_history)
+    if len(frames) != int(history):
+        raise RuntimeError(f"expected exactly {history} prior coarse frames, got {len(frames)}")
     coarse = torch.cat(frames, dim=0).unsqueeze(0)
     coarse_tidx = torch.arange(history).repeat_interleave(4).unsqueeze(0)
     fine = fine_tokens.unsqueeze(0)
@@ -176,26 +302,43 @@ def build_tokens(coarse_history, fine_tokens, history):
     return coarse, coarse_tidx, fine, fine_tidx
 
 
-def waypoint_to_pan_tilt(cot_theta_deg, current_pan=1500, current_tilt=1500):
-    pan_delta = -cot_theta_deg * 3
-    return (max(500, min(2500, int(current_pan + pan_delta))),
-            current_tilt)
+def _recenter_pan(current_pan: int, elapsed: float, rate_per_second: float) -> int:
+    max_step = max(0.0, float(rate_per_second)) * max(0.0, float(elapsed))
+    if max_step <= 0:
+        return int(current_pan)
+    delta = 1500.0 - float(current_pan)
+    if abs(delta) <= max_step:
+        return 1500
+    return int(round(float(current_pan) + math.copysign(max_step, delta)))
 
 
-MOCK_KEYS = {
-    "stop": " ",
-    "forward": "w",
-    "backward": "s",
-    "turn_left": "a",
-    "turn_right": "d",
-    "strafe_left": "q",
-    "strafe_right": "e",
-}
+def waypoint_to_pan_tilt(
+    cot_theta_deg,
+    current_pan=1500,
+    current_tilt=1500,
+    *,
+    confidence=1.0,
+    invalid_pred=False,
+    stop_confidence=0.3,
+    elapsed=0.0,
+    pan_recenter_per_s=30.0,
+):
+    valid_target = (
+        math.isfinite(float(cot_theta_deg))
+        and math.isfinite(float(confidence))
+        and not bool(invalid_pred)
+        and float(confidence) >= float(stop_confidence)
+    )
+    if not valid_target or abs(float(cot_theta_deg)) < 2.0:
+        pan = _recenter_pan(current_pan, elapsed, pan_recenter_per_s)
+        return max(500, min(2500, pan)), int(current_tilt)
+    pan_delta = -float(cot_theta_deg) * 3.0
+    return max(500, min(2500, int(float(current_pan) + pan_delta))), int(current_tilt)
 
 
 def clamp_float(value, min_value, max_value):
     value = float(value)
-    if value != value or value in (float("inf"), float("-inf")):
+    if not math.isfinite(value):
         return 0.0
     return max(min_value, min(max_value, value))
 
@@ -204,25 +347,24 @@ def waypoint_to_action_command(waypoints, args):
     n_waypoints = int(waypoints.shape[0])
     if n_waypoints <= 0:
         raise RuntimeError("model returned no waypoints")
-    idx = max(0, min(int(args.control_waypoint_index), n_waypoints - 1))
-    horizon = (idx + 1) * float(args.control_dt)
+    index = max(0, min(int(args.control_waypoint_index), n_waypoints - 1))
+    horizon = (index + 1) * float(args.control_dt)
     if horizon <= 0:
         raise ValueError("--control_dt must be > 0")
 
-    selected_wp = waypoints[idx].detach().float().cpu().tolist()
-    raw_action = [float(value) / horizon for value in selected_wp[:3]]
+    selected_waypoint = waypoints[index].detach().float().cpu().tolist()
+    raw_action = [float(value) / horizon for value in selected_waypoint[:3]]
     max_abs = float(args.max_action_abs)
     action = [clamp_float(value, -max_abs, max_abs) for value in raw_action]
-
     motors = waypoint_to_motor(action, scale=float(args.motor_scale))
     if args.min_motor_delta > 0:
         motors = boosted_motors(motors, args.min_motor_delta)
 
     debug = {
-        "control_waypoint_index": idx,
+        "control_waypoint_index": index,
         "control_dt": float(args.control_dt),
         "control_horizon": horizon,
-        "raw_waypoint": selected_wp,
+        "raw_waypoint": selected_waypoint,
         "raw_action": raw_action,
         "action": action,
         "motor_scale": float(args.motor_scale),
@@ -232,22 +374,115 @@ def waypoint_to_action_command(waypoints, args):
     return motors, debug
 
 
+def _numeric_values(value):
+    if hasattr(value, "detach"):
+        value = value.detach().float().cpu().tolist()
+    if isinstance(value, (list, tuple)):
+        output = []
+        for item in value:
+            output.extend(_numeric_values(item))
+        return output
+    try:
+        return [float(value)]
+    except (TypeError, ValueError):
+        return []
+
+
+def prediction_safety_reasons(confidence, invalid_streak, waypoints, raw_action, args):
+    reasons = []
+    try:
+        confidence_value = float(confidence)
+    except (TypeError, ValueError):
+        confidence_value = float("nan")
+    if not math.isfinite(confidence_value):
+        reasons.append("confidence_nonfinite")
+    elif confidence_value < float(args.stop_confidence):
+        reasons.append("low_confidence")
+    if int(invalid_streak) >= int(args.invalid_stop_frames):
+        reasons.append("invalid_streak")
+
+    limit = float(args.max_waypoint_abs)
+    for label, values in (("waypoint", _numeric_values(waypoints)), ("action", _numeric_values(raw_action))):
+        if not values:
+            reasons.append(f"{label}_empty")
+            continue
+        if any(not math.isfinite(value) for value in values):
+            reasons.append(f"{label}_nonfinite")
+        elif any(abs(value) > limit for value in values):
+            reasons.append(f"{label}_out_of_bounds")
+    return reasons
+
+
+def make_mock_result(args):
+    mock = command_from_key(MOCK_KEYS[args.mock_action], args.mock_speed)
+    motors = mock.motors
+    return {
+        "motors": motors,
+        "confidence": 1.0,
+        "mode": 0,
+        "stop": args.mock_action == "stop",
+        "debug": {
+            "mock_control": True,
+            "mock_action": args.mock_action,
+            "mock_speed": args.mock_speed,
+            "action": mock.action,
+            "motor_delta": motor_delta(motors),
+        },
+    }
+
+
+def make_stop_result(reason: str, **debug_fields):
+    debug = {"stop_reason": reason, "motor_delta": 0}
+    debug.update(debug_fields)
+    return {
+        "motors": list(NEUTRAL_MOTORS),
+        "confidence": 0.0,
+        "stop": True,
+        "debug": debug,
+    }
+
+
+def apply_shadow_output(intended_motors, debug):
+    shadow_debug = dict(debug)
+    shadow_debug["shadow_mode"] = True
+    shadow_debug["shadow_intended_motors"] = list(intended_motors)
+    shadow_debug["shadow_intended_action"] = list(debug.get("action", []))
+    return list(NEUTRAL_MOTORS), True, shadow_debug
+
+
+def reset_safety_state(state):
+    state.clear()
+    state["last_action"] = [0.0, 0.0, 0.0]
+
+
 def default_device():
     try:
         import torch
-        if torch.backends.mps.is_available():
-            return "mps"
+
         if torch.cuda.is_available():
             return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
     except ImportError:
         pass
     return "cpu"
 
 
+def _scalar_bool(value) -> bool:
+    if hasattr(value, "item"):
+        value = value.item()
+    return bool(value)
+
+
+def _initial_state_for_frame(model, args, rolling_state, batch_size, device):
+    if args.state_mode == "stateless" or rolling_state is None:
+        return model.init_state(batch_size, device)
+    return rolling_state
+
+
 def handle_connection(conn, addr, args, model, encoder, device):
     conn.settimeout(args.timeout)
     print(f"[server] connected: {addr}")
-
     hello = recv_json(conn)
     if hello is None:
         print("[server] client disconnected before hello; waiting for next client")
@@ -255,146 +490,235 @@ def handle_connection(conn, addr, args, model, encoder, device):
     instruction = hello.get("instruction", "follow the person")
     print(f"[server] instruction: {instruction}")
 
-    B = 1
-    state = model.init_state(B, device) if model is not None else None
-    coarse_history = []
+    batch_size = 1
+    rolling_state = None
+    history_buffer = CoarseHistoryBuffer(args.history, args.warmup_frames)
     pan, tilt = 1500, 1500
+    invalid_streak = 0
+    safety_state = {"last_action": [0.0, 0.0, 0.0]}
     frame_count = 0
+    last_frame_time = time.monotonic()
 
     try:
         while True:
             frame = recv_jpeg_frame(conn)
             if frame is None:
                 break
+            frame_started = time.monotonic()
+            elapsed = max(0.0, frame_started - last_frame_time)
+            last_frame_time = frame_started
+            started = time.time()
 
-            t0 = time.time()
             if args.mock_control:
-                mock = command_from_key(MOCK_KEYS[args.mock_action], args.mock_speed)
-                motors = mock.motors
-                confidence = 1.0
-                mode = 0
-                debug = {
-                    "mock_control": True,
-                    "mock_action": args.mock_action,
-                    "mock_speed": args.mock_speed,
-                    "action": mock.action,
-                    "motor_delta": motor_delta(motors),
-                }
+                result = make_mock_result(args)
+                mode = result.pop("mode")
+                payload_mode = mode
             else:
                 import torch
 
                 coarse_frame, fine_frame = encode_frame(frame, encoder)
-                coarse_history.append(coarse_frame)
-                if len(coarse_history) > args.history:
-                    coarse_history = coarse_history[-args.history:]
-                coarse, c_tidx, fine, f_tidx = build_tokens(coarse_history, fine_frame, args.history)
-
-                with torch.inference_mode():
-                    out = model.forward_step(
-                        coarse_tokens=coarse.to(device),
-                        coarse_tidx=c_tidx.to(device),
-                        fine_tokens=fine.to(device),
-                        fine_tidx=f_tidx.to(device),
-                        instructions=[instruction],
-                        prev_state=state,
+                if not history_buffer.ready_for_inference():
+                    history_buffer.append_after_inference(coarse_frame)
+                    result = make_stop_result(
+                        "warmup",
+                        warmup_seen=history_buffer.seen_frames,
+                        warmup_frames=args.warmup_frames,
                     )
-                state = out["new_state"]
-                wp = out["waypoints"][0]  # (8, 3)
+                    mode = None
+                    payload_mode = None
+                else:
+                    coarse_frames = history_buffer.frames_for_inference()
+                    coarse, coarse_tidx, fine, fine_tidx = build_tokens(
+                        coarse_frames,
+                        fine_frame,
+                        args.history,
+                    )
+                    state = _initial_state_for_frame(model, args, rolling_state, batch_size, device)
+                    with torch.inference_mode():
+                        output = model.forward_step(
+                            coarse_tokens=coarse.to(device),
+                            coarse_tidx=coarse_tidx.to(device),
+                            fine_tokens=fine.to(device),
+                            fine_tidx=fine_tidx.to(device),
+                            instructions=[instruction],
+                            prev_state=state,
+                        )
+                    history_buffer.append_after_inference(coarse_frame)
+                    rolling_state = output["new_state"] if args.state_mode == "rolling" else None
+                    waypoints = output["waypoints"][0]
+                    intended_motors, debug = waypoint_to_action_command(waypoints, args)
+                    confidence = float(output["C"][0].item())
+                    invalid_pred = _scalar_bool(output["cot_decoded"]["invalid_pred"][0])
+                    invalid_streak = invalid_streak + 1 if invalid_pred else 0
+                    mode = int(output["orch"]["mode"][0].item())
+                    debug["orchestrator_mode"] = mode
+                    reasons = prediction_safety_reasons(
+                        confidence,
+                        invalid_streak,
+                        waypoints,
+                        debug["raw_action"],
+                        args,
+                    )
+                    safety_stop = bool(reasons)
+                    cot_theta = float(output["cot_decoded"]["theta_deg"][0].item())
+                    pan, tilt = waypoint_to_pan_tilt(
+                        cot_theta,
+                        pan,
+                        tilt,
+                        confidence=confidence,
+                        invalid_pred=(invalid_pred or safety_stop),
+                        stop_confidence=args.stop_confidence,
+                        elapsed=elapsed,
+                        pan_recenter_per_s=args.pan_recenter_per_s,
+                    )
 
-                motors, debug = waypoint_to_action_command(wp, args)
+                    sent_motors = intended_motors
+                    stop = False
+                    if safety_stop:
+                        sent_motors = list(NEUTRAL_MOTORS)
+                        stop = True
+                        reset_safety_state(safety_state)
+                        debug["safety_stop_reasons"] = reasons
+                        debug["safety_state_reset"] = True
+                        if args.state_mode == "rolling":
+                            rolling_state = None
+                    else:
+                        safety_state["last_action"] = list(debug["action"])
 
-                # Use Polar-CoT for pan-tilt
-                cot_theta = out["cot_decoded"]["theta_deg"][0].item()
-                pan, tilt = waypoint_to_pan_tilt(cot_theta, pan, tilt)
-                confidence = float(out["C"][0].item())
-                mode = int(out["orch"]["mode"][0].item())
+                    if args.shadow_mode:
+                        sent_motors, stop, debug = apply_shadow_output(intended_motors, debug)
+                        print(
+                            f"[shadow] seq={frame_count + 1} intended_motors={intended_motors} "
+                            f"action={debug['action']} safety_reasons={reasons}"
+                        )
 
-            dt = time.time() - t0
+                    result = {
+                        "motors": sent_motors,
+                        "confidence": confidence,
+                        "stop": stop,
+                        "debug": debug,
+                    }
+                    payload_mode = None
+
+            duration = time.time() - started
             frame_count += 1
-
-            send_json(conn, {
+            payload = {
                 "type": "command",
                 "seq": frame_count,
-                "motors": motors,
+                "motors": result["motors"],
                 "pan": pan,
                 "tilt": tilt,
-                "fps": 1.0 / max(dt, 0.001),
-                "confidence": confidence,
-                "mode": mode,
-                "stop": args.mock_control and args.mock_action == "stop",
-                "debug": debug,
-            })
+                "fps": 1.0 / max(duration, 0.001),
+                "confidence": result["confidence"],
+                "stop": result["stop"],
+                "debug": result["debug"],
+            }
+            # Preserve the existing mock protocol exactly.  Real-model mode is
+            # diagnostic-only for orchestrator mode, per the WS1 safety plan.
+            if payload_mode is not None:
+                payload["mode"] = payload_mode
+            send_json(conn, payload)
 
             if frame_count % 30 == 0:
-                print(f"  frame={frame_count} dt={dt*1000:.0f}ms fps={1/max(dt,0.001):.1f} "
-                      f"C={confidence:.2f} mode={mode} motor_delta={debug['motor_delta']}")
+                print(
+                    f"  frame={frame_count} dt={duration * 1000:.0f}ms "
+                    f"fps={1 / max(duration, 0.001):.1f} C={result['confidence']:.2f} "
+                    f"mode={mode} motor_delta={result['debug']['motor_delta']}"
+                )
 
     except socket.timeout:
         print("[server] socket timeout")
     except (ConnectionResetError, ConnectionError, OSError) as exc:
         print(f"[server] connection closed: {exc}")
     finally:
+        reset_safety_state(safety_state)
         print(f"[server] client done. processed {frame_count} frames.")
     return frame_count
 
 
-def main():
+def build_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", default=None)
+    parser.add_argument("--port", type=int, default=9999)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--opentrackvla_root", default=None, help="Path to OpenTrackVLA source.")
+    parser.add_argument("--base_hf_model_dir", default=None, help="Official OpenTrackVLA HF checkpoint directory.")
+    parser.add_argument("--qwen_model_path", default=None, help="Optional local Qwen directory.")
+    parser.add_argument("--dinov3_model_path", default=None, help="Optional local DINOv3 directory.")
+    parser.add_argument("--siglip_model_path", default=None, help="Optional local SigLIP directory.")
+    parser.add_argument("--history", type=int, default=31)
+    parser.add_argument(
+        "--warmup_frames",
+        type=int,
+        default=None,
+        help="Stop-only startup frames; defaults to the resolved history value.",
+    )
+    parser.add_argument("--state_mode", choices=("stateless", "rolling"), default="stateless")
+    parser.add_argument("--mock_control", action="store_true", help="Skip model loading for protocol tests.")
+    parser.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
+    parser.add_argument("--mock_speed", type=int, default=200)
+    parser.add_argument("--control_dt", type=float, default=0.1)
+    parser.add_argument("--control_waypoint_index", type=int, default=1)
+    parser.add_argument("--motor_scale", type=float, default=400.0)
+    parser.add_argument("--min_motor_delta", type=int, default=0)
+    parser.add_argument("--max_action_abs", type=float, default=1.0)
+    parser.add_argument("--stop_confidence", type=float, default=0.3)
+    parser.add_argument("--invalid_stop_frames", type=int, default=5)
+    parser.add_argument("--max_waypoint_abs", type=float, default=2.0)
+    parser.add_argument("--pan_recenter_per_s", type=float, default=30.0)
+    parser.add_argument("--label_mode", choices=("absolute", "step_action"), default=None)
+    parser.add_argument("--force", action="store_true", help="Acknowledge explicit CLI overrides of checkpoint metadata.")
+    parser.add_argument("--allow_random_init", action="store_true")
+    parser.add_argument("--shadow_mode", action="store_true")
+    parser.add_argument("--timeout", type=float, default=2.0)
+    parser.add_argument("--no_cleanup_port", action="store_true")
+    parser.add_argument("--cleanup_dry_run", action="store_true")
+    return parser
+
+
+def validate_args(parser, args):
+    if args.control_dt <= 0:
+        parser.error("--control_dt must be > 0")
+    if args.control_waypoint_index < 0:
+        parser.error("--control_waypoint_index must be >= 0")
+    if args.motor_scale <= 0:
+        parser.error("--motor_scale must be > 0")
+    if args.min_motor_delta < 0:
+        parser.error("--min_motor_delta must be >= 0")
+    if args.max_action_abs <= 0:
+        parser.error("--max_action_abs must be > 0")
+    if not 0.0 <= args.stop_confidence <= 1.0:
+        parser.error("--stop_confidence must be in [0, 1]")
+    if args.invalid_stop_frames <= 0:
+        parser.error("--invalid_stop_frames must be > 0")
+    if args.max_waypoint_abs <= 0:
+        parser.error("--max_waypoint_abs must be > 0")
+    if args.pan_recenter_per_s < 0:
+        parser.error("--pan_recenter_per_s must be >= 0")
+    if args.allow_random_init and not args.shadow_mode:
+        parser.error("--allow_random_init requires --shadow_mode")
+    if args.warmup_frames is None:
+        args.warmup_frames = args.history
+    if args.warmup_frames < args.history:
+        parser.error("--warmup_frames must be >= --history")
+
+
+def main(argv=None):
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(raw_argv)
 
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", default=None)
-    ap.add_argument("--port", type=int, default=9999)
-    ap.add_argument("--device", default=None)
-    ap.add_argument("--opentrackvla_root", default=None,
-                    help="Path to OpenTrackVLA source. Defaults to bundled third_party/OpenTrackVLA.")
-    ap.add_argument("--base_hf_model_dir", default=None,
-                    help="Official OpenTrackVLA HuggingFace checkpoint directory.")
-    ap.add_argument("--qwen_model_path", default=None,
-                    help="Optional local Qwen/Qwen3-0.6B directory for offline inference.")
-    ap.add_argument("--dinov3_model_path", default=None,
-                    help="Local DINOv3 model directory downloaded from ModelScope or HuggingFace.")
-    ap.add_argument("--siglip_model_path", default=None,
-                    help="Optional local SigLIP directory for offline inference.")
-    ap.add_argument("--history", type=int, default=31)
-    ap.add_argument("--mock_control", action="store_true",
-                    help="Do not load the model; return a fixed safe command for protocol testing.")
-    ap.add_argument("--mock_action", choices=sorted(MOCK_KEYS), default="stop")
-    ap.add_argument("--mock_speed", type=int, default=200)
-    ap.add_argument("--control_dt", type=float, default=0.1,
-                    help="Seconds between trained waypoints; used to convert waypoint displacement to action.")
-    ap.add_argument("--control_waypoint_index", type=int, default=1,
-                    help="Future waypoint index used for motor control. action = waypoint / ((index + 1) * dt).")
-    ap.add_argument("--motor_scale", type=float, default=400.0,
-                    help="PWM speed scale passed to waypoint_to_motor after waypoint-to-action conversion.")
-    ap.add_argument("--min_motor_delta", type=int, default=0,
-                    help="Optional minimum PWM delta from neutral for nonzero motor commands.")
-    ap.add_argument("--max_action_abs", type=float, default=1.0,
-                    help="Clamp each normalized action component to +/- this value before motor conversion.")
-    ap.add_argument("--timeout", type=float, default=2.0)
-    ap.add_argument("--no_cleanup_port", action="store_true",
-                    help="Do not kill an existing process listening on --port before startup.")
-    ap.add_argument("--cleanup_dry_run", action="store_true",
-                    help="Print cleanup targets without killing them.")
-    args = ap.parse_args()
-
-    if args.control_dt <= 0:
-        ap.error("--control_dt must be > 0")
-    if args.control_waypoint_index < 0:
-        ap.error("--control_waypoint_index must be >= 0")
-    if args.motor_scale <= 0:
-        ap.error("--motor_scale must be > 0")
-    if args.min_motor_delta < 0:
-        ap.error("--min_motor_delta must be >= 0")
-    if args.max_action_abs <= 0:
-        ap.error("--max_action_abs must be > 0")
-
-    if not args.no_cleanup_port:
+    if not args.no_cleanup_port and args.cleanup_dry_run:
         cleanup_port(args.port, dry_run=args.cleanup_dry_run)
-        if args.cleanup_dry_run:
-            return
+        return
 
     if args.mock_control:
+        apply_checkpoint_metadata(args, None, raw_argv)
+        validate_args(parser, args)
+        if not args.no_cleanup_port:
+            cleanup_port(args.port, dry_run=False)
         device = None
         model = None
         encoder = None
@@ -403,17 +727,46 @@ def main():
 
         opentrackvla_root = resolve_opentrackvla_root(args.opentrackvla_root)
         sys.path.insert(0, str(opentrackvla_root))
+        configure_checkpoint_path(args, opentrackvla_root)
+        checkpoint = None
+        if args.ckpt and Path(args.ckpt).is_file():
+            checkpoint = torch.load(args.ckpt, map_location="cpu")
+        apply_checkpoint_metadata(args, checkpoint.get("meta") if checkpoint else None, raw_argv)
+        validate_args(parser, args)
+        enforce_checkpoint_policy(
+            checkpoint,
+            args.label_mode,
+            args.allow_random_init,
+            args.shadow_mode,
+        )
+        if not args.no_cleanup_port:
+            cleanup_port(args.port, dry_run=False)
         configure_default_weight_paths(args, opentrackvla_root)
+        if args.state_mode == "rolling":
+            print("!!! [server] WARNING: rolling PFEM state is experimental and differs from the training distribution")
+
         from cache_gridpool import VisionCacheConfig, VisionFeatureCacher
 
         device = torch.device(args.device or default_device())
         print(f"[server] OpenTrackVLA root: {opentrackvla_root}")
         print(f"[server] base_hf_model_dir: {args.base_hf_model_dir or '(not set)'}")
         print(f"[server] pfem_ckpt: {args.ckpt or '(not set)'}")
+        print(
+            f"[server] checkpoint meta: history={args.history} dt={args.control_dt} "
+            f"label_mode={args.label_mode} n_waypoints={args.n_waypoints}"
+        )
         print(f"[server] DINOV3_MODEL_PATH: {os.environ.get('DINOV3_MODEL_PATH', '(not set)')}")
         print(f"[server] QWEN_MODEL_PATH: {os.environ.get('QWEN_MODEL_PATH', '(not set)')}")
         print(f"[server] SIGLIP_MODEL_PATH: {os.environ.get('SIGLIP_MODEL_PATH', '(not set)')}")
-        model = load_model(args.ckpt, device, opentrackvla_root, base_hf_model_dir=args.base_hf_model_dir)
+        model = load_model(
+            checkpoint,
+            device,
+            opentrackvla_root,
+            base_hf_model_dir=args.base_hf_model_dir,
+            n_waypoints=args.n_waypoints,
+            label_mode=args.label_mode,
+            allow_random_init=args.allow_random_init,
+        )
         encoder_device = "cuda" if device.type == "cuda" else "cpu"
         encoder = VisionFeatureCacher(VisionCacheConfig(image_size=384, batch_size=1, device=encoder_device))
         encoder.eval()

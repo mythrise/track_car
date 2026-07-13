@@ -4,7 +4,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
-import os, json, math, argparse
+import os, sys, json, math, argparse
 from pathlib import Path
 from contextlib import nullcontext
 from PIL import Image, ImageDraw
@@ -18,6 +18,13 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModel
 from cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens, adapt_siglip_grid
 from local_weights import default_qwen_candidates, resolve_local_model_path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if (REPO_ROOT / 'data_pipeline').is_dir() and str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from data_pipeline.kinematics import integrate_actions
+from data_pipeline.target_detector import load_omdet_components
 
 
 # ----------------------- utils -----------------------
@@ -47,27 +54,59 @@ def load_tokens_file(path: str) -> torch.Tensor:
 
 
 def integrate_actions_to_waypoints(actions: np.ndarray, n_waypoints: int, dt: float = 0.2) -> np.ndarray:
-    a = np.asarray(actions, dtype=np.float32)
-    if a.ndim == 1: a = a[None, :]
-    T, D = a.shape
-    vx = a[:, 0].astype(np.float32)
-    vy = a[:, 1].astype(np.float32) if D > 1 else np.zeros_like(vx)
-    wz = a[:, 2].astype(np.float32) if D > 2 else np.zeros_like(vx)
+    """Compatibility wrapper over the repository's shared kinematics."""
 
-    x = np.zeros(T, dtype=np.float32)
-    y = np.zeros(T, dtype=np.float32)
-    th = np.zeros(T, dtype=np.float32)
+    trajectory = integrate_actions(actions, dt)
+    if trajectory.shape[0] == 0:
+        return trajectory
+    if n_waypoints <= 1:
+        return trajectory[-1:]
+    if trajectory.shape[0] == n_waypoints:
+        return trajectory
+    indices = np.linspace(0, trajectory.shape[0] - 1, n_waypoints).round().astype(int)
+    return trajectory[indices]
 
-    for t in range(1, T):
-        th[t] = th[t-1] + wz[t-1] * dt
-        c, s = np.cos(th[t-1]), np.sin(th[t-1])
-        x[t] = x[t-1] + (c * vx[t-1] - s * vy[t-1]) * dt
-        y[t] = y[t-1] + (s * vx[t-1] + c * vy[t-1]) * dt
 
-    traj = np.stack([x, y, th], axis=-1)
-    if n_waypoints <= 1: return traj[-1:]
-    idx = np.linspace(0, T-1, n_waypoints).round().astype(int)
-    return traj[idx]
+def dataset_manifest_path(dataset_path: Path) -> Path:
+    return Path(str(dataset_path) + '.manifest.json')
+
+
+def load_dataset_manifest(dataset_path: Path) -> Optional[Dict[str, Any]]:
+    manifest_path = dataset_manifest_path(dataset_path)
+    if not manifest_path.exists():
+        return None
+    with open(manifest_path, 'r') as f:
+        manifest = json.load(f)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Dataset manifest must be a JSON object: {manifest_path}")
+    if int(manifest.get('schema_version', -1)) != 1:
+        raise ValueError(f"Unsupported dataset manifest schema_version: {manifest_path}")
+    for field in ('path_root', 'fps', 'dt', 'action_semantics', 'label_mode'):
+        if field not in manifest:
+            raise ValueError(f"Dataset manifest missing {field!r}: {manifest_path}")
+    if not isinstance(manifest['path_root'], str) or not manifest['path_root'].strip():
+        raise ValueError(f"Invalid path_root in {manifest_path}: {manifest['path_root']!r}")
+    if manifest['label_mode'] not in ('absolute', 'step_action'):
+        raise ValueError(f"Unknown label_mode in {manifest_path}: {manifest['label_mode']!r}")
+    semantics = manifest['action_semantics']
+    semantics_values = semantics if isinstance(semantics, list) else [semantics]
+    if not semantics_values or any(value not in ('spin_v1', 'arc_turn_v2') for value in semantics_values):
+        raise ValueError(f"Unknown action_semantics in {manifest_path}: {semantics!r}")
+    fps_values = manifest['fps'] if isinstance(manifest['fps'], list) else [manifest['fps']]
+    dt_values = manifest['dt'] if isinstance(manifest['dt'], list) else [manifest['dt']]
+    if not fps_values or any(float(value) <= 0 for value in fps_values):
+        raise ValueError(f"Invalid fps in {manifest_path}: {manifest['fps']!r}")
+    if not dt_values or any(float(value) <= 0 for value in dt_values):
+        raise ValueError(f"Invalid dt in {manifest_path}: {manifest['dt']!r}")
+    if len(fps_values) == len(dt_values):
+        for fps, dt in zip(fps_values, dt_values):
+            if not math.isclose(float(dt), 1.0 / float(fps), rel_tol=1e-4, abs_tol=1e-6):
+                raise ValueError(
+                    f"Inconsistent fps/dt in {manifest_path}: fps={fps!r}, dt={dt!r}"
+                )
+    elif len(fps_values) != 1 or len(dt_values) != 1:
+        raise ValueError(f"fps/dt cardinality mismatch in {manifest_path}")
+    return manifest
 
 
 # Flexible loader for JSON/JSONL datasets and directories
@@ -193,6 +232,7 @@ class OpenTrackVLA(nn.Module):
     def __init__(self, cfg: ModelConfig, vision_feat_dim: int):
         super().__init__()
         self.cfg = cfg
+        self.default_dt = float(cfg.default_dt)
         llm_path = resolve_local_model_path(
             label="Qwen/Qwen3-0.6B",
             repo_id="Qwen/Qwen3-0.6B",
@@ -321,14 +361,45 @@ class JsonTrackingDataset(Dataset):
         super().__init__()
         self.cfg = cfg
         p = Path(cfg.train_json)
-        candidate = p if p.is_dir() else p.parent
-        max_up = 4
-        while max_up >= 0 and not (candidate / 'frames').exists():
-            if candidate.parent == candidate:
-                break
-            candidate = candidate.parent
-            max_up -= 1
-        self.base_root = candidate
+        manifest_sources: List[Path] = []
+        if p.is_file() and p.suffix.lower() == '.jsonl':
+            manifest_sources = [p]
+        elif p.is_dir():
+            manifest_sources = sorted(p.rglob('*.jsonl'))
+        manifests = [(source, load_dataset_manifest(source)) for source in manifest_sources]
+        manifests = [(source, manifest) for source, manifest in manifests if manifest is not None]
+        self.manifest = manifests[0][1] if len(manifests) == 1 else None
+        if self.manifest is not None and not isinstance(self.manifest['dt'], list):
+            self.default_dt = float(self.manifest['dt'])
+        if manifests:
+            roots = {
+                str((source.parent / str(manifest['path_root'])).resolve())
+                for source, manifest in manifests
+            }
+            if len(roots) != 1:
+                raise ValueError(f"Dataset manifests disagree on path_root: {sorted(roots)}")
+            self.base_root = Path(next(iter(roots)))
+            if not self.base_root.exists():
+                raise FileNotFoundError(f"Dataset manifest path_root does not exist: {self.base_root}")
+            for source, manifest in manifests:
+                if 'history' in manifest and int(manifest['history']) != int(cfg.history):
+                    raise ValueError(
+                        f"Dataset history mismatch for {source}: manifest={manifest['history']} cfg={cfg.history}"
+                    )
+                if 'n_waypoints' in manifest and int(manifest['n_waypoints']) != int(cfg.n_waypoints):
+                    raise ValueError(
+                        f"Dataset n_waypoints mismatch for {source}: "
+                        f"manifest={manifest['n_waypoints']} cfg={cfg.n_waypoints}"
+                    )
+        else:
+            candidate = p if p.is_dir() else p.parent
+            max_up = 4
+            while max_up >= 0 and not (candidate / 'frames').exists():
+                if candidate.parent == candidate:
+                    break
+                candidate = candidate.parent
+                max_up -= 1
+            self.base_root = candidate
         self.cache_root = Path(cfg.cache_root) if cfg.cache_root is not None else (self.base_root / "vision_cache")
         self._online_encoder: Optional[VisionFeatureCacher] = None
         self._bbox_processor = None
@@ -390,11 +461,9 @@ class JsonTrackingDataset(Dataset):
             from torch.utils.data import get_worker_info
             worker_info = get_worker_info()
             use_cuda = torch.cuda.is_available() and (worker_info is None)
-            device = torch.device('cuda' if use_cuda else 'cpu')
+            device = 'cuda' if use_cuda else 'cpu'
             try:
-                from transformers import AutoProcessor, OmDetTurboForObjectDetection
-                self._bbox_processor = AutoProcessor.from_pretrained("omlab/omdet-turbo-swin-tiny-hf")
-                self._bbox_model = OmDetTurboForObjectDetection.from_pretrained("omlab/omdet-turbo-swin-tiny-hf").to(device).eval()
+                self._bbox_processor, self._bbox_model = load_omdet_components(device)
             except Exception as _e:
                 print(f"[bbox] failed to init omdet-turbo: {_e}")
                 self._bbox_processor = None
@@ -511,7 +580,7 @@ class JsonTrackingDataset(Dataset):
             wp = torch.tensor(ex['waypoints'], dtype=torch.float32)
         else:
             assert 'actions' in ex, "JSON needs either 'waypoints' or 'actions'"
-            dt = float(ex.get('dt', self.cfg.default_dt))
+            dt = float(ex.get('dt', self.default_dt))
             traj = integrate_actions_to_waypoints(np.asarray(ex['actions'], dtype=np.float32), self.cfg.n_waypoints, dt)
             wp = torch.from_numpy(traj)
 
