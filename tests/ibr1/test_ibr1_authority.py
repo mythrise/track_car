@@ -8,10 +8,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from f2_experiment.assembly import (
+    F2AssemblyContractError,
+    _resolve_frozen_token_ledger,
+)
 from f2_experiment.cli import SOURCE_FILES, TRANSITIVE_SOURCE_FILES
 from f2_experiment.reproducibility import CUDA_REPRODUCIBILITY_SETTINGS
 
@@ -825,6 +830,14 @@ def test_bootstrap_is_fresh_sealed_and_freeze_null(
     assert document["test_binding"]["analysis_class"] == authority.TEST_BINDING_CLASS
     assert document["support_binding"]["analysis_class"] == authority.SUPPORT_BINDING_CLASS
     assert document["asset_binding"]["analysis_class"] == authority.ASSET_BINDING_CLASS
+    asset_binding = document["asset_binding"]
+    asset_observation = asset_binding["observation"]
+    assert asset_binding["token_ledger_sha256"] == asset_observation[
+        "token_ledger_sha256"
+    ]
+    assert asset_binding["token_ledger_file_count"] == asset_observation[
+        "token_ledger_file_count"
+    ]
     eval_support = document["support_binding"]["observation"]["supports"]["EVAL-FIX"]
     assert eval_support["rows"] == 512
     assert eval_support["ordered_original_indices_sha256"] == (
@@ -853,6 +866,74 @@ def test_bootstrap_is_fresh_sealed_and_freeze_null(
             lambda_adoption_freeze_path=root / "fake.json",
             support_observer=_support_observer(support_observation),
             asset_observer=_asset_observer,
+        )
+
+
+def test_bootstrap_token_ledger_anchor_is_consumable_by_f2_cal_and_fail_closed(
+    tmp_path: Path,
+    support_observation: dict[str, Any],
+) -> None:
+    root = _clone_receipt_project(tmp_path / "project")
+    bootstrap = authority.build_assembly_receipt(
+        root,
+        phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+        support_observer=_support_observer(support_observation),
+        asset_observer=_asset_observer,
+    )
+    frozen_sha = bootstrap["asset_binding"]["token_ledger_sha256"]
+    frozen_count = bootstrap["asset_binding"]["token_ledger_file_count"]
+    ledger = SimpleNamespace(
+        ledger_sha256=frozen_sha,
+        token_files=frozen_count,
+    )
+
+    assert (
+        _resolve_frozen_token_ledger(root, bootstrap, token_ledger=ledger)
+        is ledger
+    )
+
+    nested_only = copy.deepcopy(bootstrap)
+    nested_only["asset_binding"].pop("token_ledger_sha256")
+    nested_only["asset_binding"].pop("token_ledger_file_count")
+    with pytest.raises(
+        F2AssemblyContractError,
+        match="does not freeze a token ledger anchor",
+    ):
+        _resolve_frozen_token_ledger(root, nested_only, token_ledger=ledger)
+
+    mismatched = copy.deepcopy(bootstrap)
+    mismatched["asset_binding"]["token_ledger_sha256"] = "0" * 64
+    with pytest.raises(F2AssemblyContractError, match="TOKEN_LEDGER_MISMATCH"):
+        _resolve_frozen_token_ledger(root, mismatched, token_ledger=ledger)
+
+    count_mismatch = copy.deepcopy(bootstrap)
+    count_mismatch["asset_binding"]["token_ledger_file_count"] -= 1
+    with pytest.raises(F2AssemblyContractError, match="file count differs"):
+        _resolve_frozen_token_ledger(
+            root,
+            count_mismatch,
+            token_ledger=ledger,
+        )
+
+
+def test_static_bootstrap_rejects_divergent_token_ledger_compatibility_anchor(
+    tmp_path: Path,
+    support_observation: dict[str, Any],
+) -> None:
+    root = _clone_receipt_project(tmp_path / "project")
+    path, bootstrap = _freeze_bootstrap(root, support_observation)
+    bootstrap["asset_binding"]["token_ledger_sha256"] = "0" * 64
+    bootstrap["asset_binding"] = _rehash(bootstrap["asset_binding"])
+    bootstrap = _rehash(bootstrap)
+    _write_canonical(path, bootstrap)
+
+    with pytest.raises(
+        authority.IBR1AuthorityError,
+        match="compatibility anchor differs",
+    ):
+        authority._verify_static_assembly(
+            path,
+            expected_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
         )
 
 
@@ -1109,6 +1190,58 @@ def test_injected_orchestrator_seam_is_fixed_command_but_non_authoritative(
         assert kwargs["stdout"] is subprocess.PIPE
         assert kwargs["stderr"] is subprocess.PIPE
         assert kwargs["text"] is True
+    assert not freeze_path.exists()
+    assert not final_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    [
+        ("missing_sha", "token ledger SHA"),
+        ("missing_count", "cardinality drifted"),
+        ("count_mismatch", "cardinality drifted"),
+    ],
+)
+def test_cal_pair_verifies_bootstrap_before_output_or_worker_burn(
+    tmp_path: Path,
+    support_observation: dict[str, Any],
+    mutation: str,
+    match: str,
+) -> None:
+    root = _clone_receipt_project(tmp_path / f"project_{mutation}")
+    bootstrap_path, bootstrap = _freeze_bootstrap(root, support_observation)
+    asset_binding = bootstrap["asset_binding"]
+    if mutation == "missing_sha":
+        asset_binding.pop("token_ledger_sha256")
+    elif mutation == "missing_count":
+        asset_binding.pop("token_ledger_file_count")
+    else:
+        asset_binding["token_ledger_file_count"] -= 1
+    bootstrap["asset_binding"] = _rehash(asset_binding)
+    bootstrap = _rehash(bootstrap)
+    _write_canonical(bootstrap_path, bootstrap)
+
+    output = root / "experiments/windows_cuda_ibr1/invalid_live_pair"
+    freeze_path = output.parent / f"{mutation}_freeze.json"
+    final_path = output.parent / f"{mutation}_final.json"
+    popen_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    def forbidden_popen(*args: Any, **kwargs: Any) -> None:
+        popen_calls.append((args, kwargs))
+        raise AssertionError("worker must not start for an invalid bootstrap")
+
+    with pytest.raises(authority.IBR1AuthorityError, match=match):
+        cal_pair._run_live_cal_pair_and_freeze(
+            root,
+            bootstrap_receipt_path=bootstrap_path,
+            output_dir=output,
+            freeze_output_path=freeze_path,
+            final_output_path=final_path,
+            popen_factory=forbidden_popen,
+        )
+
+    assert popen_calls == []
+    assert not output.exists()
     assert not freeze_path.exists()
     assert not final_path.exists()
 

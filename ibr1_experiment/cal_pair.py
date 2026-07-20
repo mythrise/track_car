@@ -695,14 +695,13 @@ def _run_live_cal_pair_and_freeze(
     _require(not output.exists(), "live CAL pair output directory must be fresh")
     _require(not freeze_output.exists(), "lambda freeze output already exists")
     _require(not final_output.exists(), "final assembly output already exists")
-    output.mkdir(parents=True, exist_ok=False)
-    _require(not any(output.iterdir()), "fresh live CAL pair output is not empty")
-
     bootstrap_document = authority.verify_assembly_receipt(
         root,
         bootstrap,
         required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
     )
+    output.mkdir(parents=True, exist_ok=False)
+    _require(not any(output.iterdir()), "fresh live CAL pair output is not empty")
     challenge = secrets.token_hex(32)
     parent_pid = os.getpid()
     executable = OFFICIAL_PYTHON_EXECUTABLE

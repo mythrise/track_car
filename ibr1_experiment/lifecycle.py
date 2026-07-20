@@ -36,6 +36,7 @@ from .assembly_model import (
     IBR1_SELF,
 )
 from .authority import (
+    ASSEMBLY_PHASE_BOOTSTRAP,
     ASSEMBLY_PHASE_FINAL,
     canonical_json_bytes,
     canonical_json_sha256,
@@ -738,6 +739,16 @@ def run_authoritative_smoke(
         freeze_output=freeze_output,
         final_output=final_output,
         smoke_output=smoke_output,
+    )
+
+    # Validate the immutable bootstrap (including the inherited F2 token
+    # ledger compatibility anchor) before creating any burn directory or
+    # candidate-lock evidence.  The CAL pair performs the same verification
+    # immediately before worker spawn to close the remaining TOCTOU window.
+    verify_assembly_receipt(
+        root,
+        bootstrap,
+        required_phase=ASSEMBLY_PHASE_BOOTSTRAP,
     )
 
     stage = "create_smoke_output"

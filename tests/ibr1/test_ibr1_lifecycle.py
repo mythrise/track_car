@@ -11,7 +11,7 @@ import pytest
 
 from ibr1_experiment import lifecycle
 from ibr1_experiment import cal_pair
-from ibr1_experiment.authority import exclusive_write_json
+from ibr1_experiment.authority import IBR1AuthorityError, exclusive_write_json
 from ibr1_experiment.eval_guard import IBR1_EVAL_PHASES
 
 
@@ -136,6 +136,12 @@ def test_live_cal_capability_and_plan_stay_in_one_parent_call(
     events: list[Any] = []
     capability = object()
 
+    monkeypatch.setattr(
+        lifecycle,
+        "verify_assembly_receipt",
+        lambda *args, **kwargs: {"phase": "bootstrap"},
+    )
+
     class FakePlan:
         def close(self) -> None:
             events.append("close")
@@ -204,6 +210,12 @@ def test_engineering_failure_burns_directory_without_result_seal(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = _paths(tmp_path)
+
+    monkeypatch.setattr(
+        lifecycle,
+        "verify_assembly_receipt",
+        lambda *args, **kwargs: {"phase": "bootstrap"},
+    )
 
     def fail_cal(*args: Any, **kwargs: Any) -> dict[str, Any]:
         del args, kwargs
@@ -282,6 +294,41 @@ def test_existing_output_fails_before_live_cal(
             smoke_output_dir=paths["smoke"],
         )
     assert called is False
+
+
+def test_missing_ledger_alias_fails_before_smoke_directory_or_candidate_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _paths(tmp_path)
+    called = False
+
+    def run_cal(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        nonlocal called
+        del args, kwargs
+        called = True
+        return {}
+
+    def reject_missing_alias(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        raise IBR1AuthorityError(
+            "assembly asset token ledger SHA must be lowercase SHA-256 hex"
+        )
+
+    monkeypatch.setattr(lifecycle, "verify_assembly_receipt", reject_missing_alias)
+    monkeypatch.setattr(lifecycle, "_OFFICIAL_CAL_RUNNER", run_cal)
+    with pytest.raises(IBR1AuthorityError, match="token ledger SHA"):
+        lifecycle.run_authoritative_smoke(
+            tmp_path,
+            bootstrap_receipt_path=paths["bootstrap"],
+            cal_output_dir=paths["cal"],
+            freeze_output_path=paths["freeze"],
+            final_output_path=paths["final"],
+            smoke_output_dir=paths["smoke"],
+        )
+
+    assert called is False
+    assert not paths["smoke"].exists()
+    assert not paths["cal"].exists()
 
 
 def test_capability_registry_ignores_writable_slot_replay(

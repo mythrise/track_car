@@ -1345,6 +1345,8 @@ def build_asset_binding(
     observed = observer(root)
     _require(isinstance(observed, Mapping), "asset observer returned no mapping")
     _validate_asset_observation(observed)
+    ledger_sha = str(observed["token_ledger_sha256"])
+    ledger_file_count = int(observed["token_ledger_file_count"])
     return _with_payload_self_hash(
         {
             "schema_version": 1,
@@ -1354,6 +1356,14 @@ def build_asset_binding(
                 "manifest_metadata_plus_train_split_per_file_ledger; "
                 "no_full_payload_reread"
             ),
+            # The subordinate F2 CAL kernel consumes the inherited assembly
+            # contract at ``asset_binding.token_ledger_*``. Freeze the exact
+            # same anchor at that compatibility surface while retaining the
+            # complete IBR1 observation below; verification requires the two
+            # copies to remain identical, so this cannot become a second
+            # independently mutable authority.
+            "token_ledger_sha256": ledger_sha,
+            "token_ledger_file_count": ledger_file_count,
             "observation": dict(observed),
             "formal_training_authorized": False,
             "internal_test": INTERNAL_TEST_POLICY,
@@ -1409,6 +1419,33 @@ def _verify_nested_binding(
     return value
 
 
+def _verify_asset_ledger_anchor(binding: Mapping[str, Any]) -> None:
+    """Require the IBR1/F2 token-ledger compatibility anchor to be singular."""
+
+    observation = binding.get("observation")
+    _require(
+        isinstance(observation, Mapping),
+        "assembly asset binding observation is missing",
+    )
+    ledger_sha = _valid_sha256(
+        binding.get("token_ledger_sha256"),
+        "assembly asset token ledger SHA",
+    )
+    ledger_file_count = binding.get("token_ledger_file_count")
+    _require(
+        isinstance(ledger_file_count, int)
+        and not isinstance(ledger_file_count, bool)
+        and ledger_file_count == FROZEN_TRAIN_TOKEN_FILES,
+        "assembly asset token ledger cardinality drifted",
+    )
+    _require(
+        observation.get("token_ledger_sha256") == ledger_sha
+        and observation.get("token_ledger_file_count") == ledger_file_count,
+        "assembly asset token ledger compatibility anchor differs from "
+        "the verified IBR1 observation",
+    )
+
+
 def _verify_static_assembly(
     path: Path, *, expected_phase: AssemblyPhase | None = None
 ) -> dict[str, Any]:
@@ -1450,11 +1487,12 @@ def _verify_static_assembly(
         expected_class=SUPPORT_BINDING_CLASS,
         label="assembly support binding",
     )
-    _verify_nested_binding(
+    asset_binding = _verify_nested_binding(
         document.get("asset_binding"),
         expected_class=ASSET_BINDING_CLASS,
         label="assembly asset binding",
     )
+    _verify_asset_ledger_anchor(asset_binding)
     _verify_nested_binding(
         document.get("authority_chain"),
         expected_class=AUTHORITY_CHAIN_CLASS,
