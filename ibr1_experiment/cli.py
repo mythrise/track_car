@@ -61,10 +61,15 @@ def _configure_runtime(*, require_cuda: bool) -> dict[str, Any]:
     try:
         if require_cuda:
             require_official_python()
+        # This must run before any availability/device query.  On real
+        # PyTorch, require_official_torch_cuda() initializes CUDA while
+        # selecting cuda:0; configuring determinism afterwards is therefore
+        # permanently too late and makes every native-Windows command fail.
+        receipt = reproducibility.configure_cuda_reproducibility(torch)
+        if require_cuda:
             require_official_torch_cuda(torch)
     except IBR1RuntimeContractError as exc:
         raise IBR1CliError(str(exc)) from exc
-    receipt = reproducibility.configure_cuda_reproducibility(torch)
     cuda_available = bool(torch.cuda.is_available())
     if require_cuda and not cuda_available:
         raise IBR1CliError(

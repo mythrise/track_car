@@ -100,6 +100,80 @@ def test_pre_torch_environment_rejects_conflicting_cublas(
         cli._prepare_pre_torch_environment()
 
 
+def test_runtime_configures_determinism_before_any_cuda_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    state = {"initialized": False, "configured": False}
+
+    class FakeCuda:
+        @staticmethod
+        def is_initialized() -> bool:
+            return state["initialized"]
+
+        @staticmethod
+        def is_available() -> bool:
+            events.append("is_available")
+            state["initialized"] = True
+            return True
+
+        @staticmethod
+        def device_count() -> int:
+            events.append("device_count")
+            state["initialized"] = True
+            return 1
+
+        @staticmethod
+        def set_device(index: int) -> None:
+            assert index == 0
+            events.append("set_device")
+            state["initialized"] = True
+
+        @staticmethod
+        def current_device() -> int:
+            events.append("current_device")
+            return 0
+
+        @staticmethod
+        def get_device_name(index: int) -> str:
+            assert index == 0
+            events.append("get_device_name")
+            return "GPU"
+
+    fake_torch = SimpleNamespace(
+        __version__="2.6.0+cu124",
+        version=SimpleNamespace(cuda="12.4"),
+        cuda=FakeCuda(),
+    )
+
+    def configure(torch_module: Any) -> dict[str, Any]:
+        events.append("configure")
+        assert torch_module is fake_torch
+        assert state["initialized"] is False
+        state["configured"] = True
+        return {"contract_id": "test"}
+
+    fake_reproducibility = SimpleNamespace(
+        configure_cuda_reproducibility=configure
+    )
+    monkeypatch.setattr(cli, "require_official_python", lambda: None)
+    monkeypatch.setattr(
+        cli,
+        "_import_module",
+        lambda name: (
+            fake_reproducibility
+            if name == "f2_experiment.reproducibility"
+            else fake_torch
+        ),
+    )
+
+    runtime = cli._configure_runtime(require_cuda=True)
+
+    assert state["configured"] is True
+    assert events[0] == "configure"
+    assert runtime["device"] == "cuda:0"
+
+
 def _runtime() -> dict[str, Any]:
     return {
         "python_executable": "python.exe",
