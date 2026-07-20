@@ -15,6 +15,8 @@ frozen train support and its train-split token ledger.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
 import json
@@ -22,7 +24,9 @@ import math
 import os
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from statistics import median
-from typing import Any, Literal
+import threading
+from typing import Any, Iterator, Literal
+from weakref import WeakKeyDictionary
 
 from f2_experiment.assembly_data import (
     FROZEN_BASE_HF_ARTIFACT_SHA256,
@@ -449,6 +453,280 @@ def _load_canonical_receipt(path: Path, label: str) -> dict[str, Any]:
     )
     _verify_payload_self_hash(document, label)
     return document
+
+
+_VERIFICATION_SESSION_SECRET = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedAssemblySnapshot:
+    """Immutable evidence from one fresh live assembly verification.
+
+    The snapshot is deliberately process-local and non-serializable.  It is
+    not authority by itself: it may only suppress repeated *nested* rebuilds
+    inside the one parent-owned authoritative lifecycle that minted it.
+    Explicit lifecycle boundaries still force a fresh source/support/asset
+    rebuild, including a fresh train-token ledger traversal.
+    """
+
+    root: str
+    path: str
+    phase: str
+    file_sha256: str
+    receipt_payload_sha256: str
+    source_binding_sha256: str
+    test_binding_sha256: str
+    support_binding_sha256: str
+    asset_binding_sha256: str
+    authority_chain_sha256: str
+    f2_negative_evidence_sha256: str
+    token_ledger_sha256: str
+    token_ledger_file_count: int
+    canonical_bytes: bytes
+
+    def __reduce__(self) -> Any:
+        raise TypeError("verified assembly snapshots are intentionally non-serializable")
+
+    def __getstate__(self) -> Any:
+        raise TypeError("verified assembly snapshots are intentionally non-serializable")
+
+
+@dataclass(slots=True)
+class _AuthorityVerificationSessionState:
+    root: Path
+    pid: int
+    thread_id: int
+    task: Any
+    active: bool
+    snapshots: dict[str, _VerifiedAssemblySnapshot]
+
+
+_VERIFICATION_SESSION_REGISTRY: WeakKeyDictionary[
+    Any, _AuthorityVerificationSessionState
+] = WeakKeyDictionary()
+
+
+def _current_async_task() -> Any:
+    try:
+        import asyncio
+
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
+
+
+class _AuthorityVerificationSession:
+    """Opaque registry key for one authoritative verification lifecycle."""
+
+    __slots__ = ("__weakref__", "_secret")
+
+    def __init__(self, secret: object, root: Path) -> None:
+        _require(
+            secret is _VERIFICATION_SESSION_SECRET,
+            "authority verification session constructor is private",
+        )
+        self._secret = secret
+        _VERIFICATION_SESSION_REGISTRY[self] = _AuthorityVerificationSessionState(
+            root=root,
+            pid=os.getpid(),
+            thread_id=threading.get_ident(),
+            task=_current_async_task(),
+            active=True,
+            snapshots={},
+        )
+
+    def __reduce__(self) -> Any:
+        raise TypeError("authority verification sessions are intentionally non-serializable")
+
+    def __getstate__(self) -> Any:
+        raise TypeError("authority verification sessions are intentionally non-serializable")
+
+
+
+def _verification_session_state(
+    session: Any,
+    root: Path,
+) -> _AuthorityVerificationSessionState:
+    state = (
+        _VERIFICATION_SESSION_REGISTRY.get(session)
+        if type(session) is _AuthorityVerificationSession
+        else None
+    )
+    _require(
+        type(session) is _AuthorityVerificationSession
+        and session._secret is _VERIFICATION_SESSION_SECRET
+        and state is not None
+        and state.active
+        and state.pid == os.getpid()
+        and state.thread_id == threading.get_ident()
+        and state.task is _current_async_task()
+        and state.root == root,
+        "authority verification session root/PID/thread/task/lifetime drifted",
+    )
+    assert state is not None
+    return state
+
+
+_CURRENT_VERIFICATION_SESSION: ContextVar[
+    _AuthorityVerificationSession | None
+] = ContextVar("ibr1_authority_verification_session", default=None)
+_FORCE_FRESH_ASSEMBLY_VERIFICATION: ContextVar[bool] = ContextVar(
+    "ibr1_force_fresh_assembly_verification", default=False
+)
+
+
+@contextmanager
+def _authoritative_verification_session(
+    secret: object,
+    project_root: str | Path,
+) -> Iterator[None]:
+    """Scope nested receipt memoization to one same-parent lifecycle call."""
+
+    _require(
+        secret is _VERIFICATION_SESSION_SECRET,
+        "authority verification session entry requires the private capability",
+    )
+    root = Path(project_root).expanduser().resolve()
+    current = _CURRENT_VERIFICATION_SESSION.get()
+    if current is not None:
+        _verification_session_state(current, root)
+        yield
+        return
+    session = _AuthorityVerificationSession(_VERIFICATION_SESSION_SECRET, root)
+    token = _CURRENT_VERIFICATION_SESSION.set(session)
+    try:
+        yield
+    finally:
+        state = _VERIFICATION_SESSION_REGISTRY.get(session)
+        if state is not None:
+            state.snapshots.clear()
+            state.active = False
+        _CURRENT_VERIFICATION_SESSION.reset(token)
+
+
+def _assembly_snapshot(
+    root: Path,
+    path: Path,
+    document: Mapping[str, Any],
+) -> _VerifiedAssemblySnapshot:
+    canonical = canonical_json_bytes(document) + b"\n"
+    try:
+        observed = path.read_bytes()
+    except OSError as exc:
+        raise IBR1AuthorityError(
+            f"cannot re-read verified assembly receipt: {path}"
+        ) from exc
+    _require(
+        observed == canonical,
+        "assembly receipt bytes drifted during fresh live verification",
+    )
+    asset = document.get("asset_binding")
+    _require(isinstance(asset, Mapping), "verified assembly asset binding is malformed")
+    ledger_sha = _valid_sha256(
+        asset.get("token_ledger_sha256"),
+        "verified assembly token ledger SHA",
+    )
+    ledger_file_count = asset.get("token_ledger_file_count")
+    _require(
+        type(ledger_file_count) is int
+        and ledger_file_count == FROZEN_TRAIN_TOKEN_FILES,
+        "verified assembly token ledger cardinality drifted",
+    )
+    return _VerifiedAssemblySnapshot(
+        root=str(root),
+        path=str(path),
+        phase=str(document["phase"]),
+        file_sha256=hashlib.sha256(observed).hexdigest(),
+        receipt_payload_sha256=str(document["receipt_payload_sha256"]),
+        source_binding_sha256=canonical_json_sha256(document["source_binding"]),
+        test_binding_sha256=canonical_json_sha256(document["test_binding"]),
+        support_binding_sha256=canonical_json_sha256(document["support_binding"]),
+        asset_binding_sha256=canonical_json_sha256(asset),
+        authority_chain_sha256=canonical_json_sha256(document["authority_chain"]),
+        f2_negative_evidence_sha256=canonical_json_sha256(
+            document["f2_negative_evidence"]
+        ),
+        token_ledger_sha256=ledger_sha,
+        token_ledger_file_count=ledger_file_count,
+        canonical_bytes=canonical,
+    )
+
+
+def _verify_cached_assembly_snapshot(
+    snapshot: _VerifiedAssemblySnapshot,
+    *,
+    root: Path,
+    path: Path,
+    required_phase: AssemblyPhase | None,
+) -> dict[str, Any]:
+    """Revalidate immutable receipt bytes without rebuilding live assets."""
+
+    _require(
+        snapshot.root == str(root) and snapshot.path == str(path),
+        "verified assembly snapshot root/path replay detected",
+    )
+    if required_phase is not None:
+        _require(
+            snapshot.phase == required_phase,
+            "verified assembly snapshot phase differs from expected",
+        )
+    try:
+        observed = path.read_bytes()
+    except OSError as exc:
+        raise IBR1AuthorityError(
+            f"cannot read cached assembly receipt: {path}"
+        ) from exc
+    _require(
+        observed == snapshot.canonical_bytes
+        and hashlib.sha256(observed).hexdigest() == snapshot.file_sha256,
+        "assembly receipt bytes drifted from the verified live snapshot",
+    )
+    document = _verify_static_assembly(path, expected_phase=required_phase)
+    asset = document.get("asset_binding")
+    _require(isinstance(asset, Mapping), "cached assembly asset binding is malformed")
+    ledger_file_count = asset.get("token_ledger_file_count")
+    _require(
+        canonical_json_bytes(document) + b"\n" == snapshot.canonical_bytes
+        and document.get("receipt_payload_sha256")
+        == snapshot.receipt_payload_sha256
+        and canonical_json_sha256(document.get("source_binding"))
+        == snapshot.source_binding_sha256
+        and canonical_json_sha256(document.get("test_binding"))
+        == snapshot.test_binding_sha256
+        and canonical_json_sha256(document.get("support_binding"))
+        == snapshot.support_binding_sha256
+        and canonical_json_sha256(asset) == snapshot.asset_binding_sha256
+        and canonical_json_sha256(document.get("authority_chain"))
+        == snapshot.authority_chain_sha256
+        and canonical_json_sha256(document.get("f2_negative_evidence"))
+        == snapshot.f2_negative_evidence_sha256
+        and asset.get("token_ledger_sha256") == snapshot.token_ledger_sha256
+        and type(ledger_file_count) is int
+        and ledger_file_count == snapshot.token_ledger_file_count,
+        "assembly snapshot payload/source/asset identity drifted",
+    )
+    return document
+
+
+def _session_bootstrap_snapshot(
+    root: Path,
+    path: Path,
+) -> dict[str, Any] | None:
+    """Return a validated bootstrap snapshot owned by the current session."""
+
+    session = _CURRENT_VERIFICATION_SESSION.get()
+    if session is None:
+        return None
+    state = _verification_session_state(session, root)
+    snapshot = state.snapshots.get(str(path))
+    if snapshot is None or snapshot.phase != ASSEMBLY_PHASE_BOOTSTRAP:
+        return None
+    return _verify_cached_assembly_snapshot(
+        snapshot,
+        root=root,
+        path=path,
+        required_phase=ASSEMBLY_PHASE_BOOTSTRAP,
+    )
 
 
 def exclusive_write_json(path: str | Path, value: Any) -> str:
@@ -1535,6 +1813,7 @@ def _build_assembly_receipt_document(
     lambda_adoption_freeze_path: str | Path | None = None,
     support_observer: Callable[[Path], Mapping[str, Any]] | None = None,
     asset_observer: Callable[[Path], Mapping[str, Any]] | None = None,
+    _reuse_verified_bootstrap: bool = False,
 ) -> dict[str, Any]:
     """Derive an assembly document for trusted builders and verification."""
 
@@ -1554,19 +1833,14 @@ def _build_assembly_receipt_document(
             "final assembly requires an IBR1 lambda-adoption freeze",
         )
 
-    source_binding = build_source_binding(root)
-    test_binding = build_test_binding(root)
-    support_binding = build_support_binding(root, observer=support_observer)
-    asset_binding = build_asset_binding(root, observer=asset_observer)
-    authority_chain = verify_authority_chain(root)
-    f2_negative = verify_f2_negative_evidence(root)
     _require(
-        authority_chain.get("f2_negative_evidence_payload_sha256")
-        == f2_negative.get("receipt_payload_sha256"),
-        "authority chain and assembly bind different F2 negative evidence",
+        not _reuse_verified_bootstrap or phase == ASSEMBLY_PHASE_FINAL,
+        "verified bootstrap reuse is private to final assembly issuance",
     )
-
     freeze_binding: dict[str, str] | None = None
+    freeze: dict[str, Any] | None = None
+    bootstrap: dict[str, Any] | None = None
+    freeze_path: Path | None = None
     if lambda_adoption_freeze_path is not None:
         freeze_path = Path(lambda_adoption_freeze_path).expanduser().resolve()
         _root_relative(root, freeze_path, "lambda-adoption freeze")
@@ -1575,9 +1849,44 @@ def _build_assembly_receipt_document(
         bootstrap_path = _resolve_bound_path(
             root, bootstrap_binding["path"], "freeze bootstrap assembly"
         )
-        bootstrap = _verify_static_assembly(
-            bootstrap_path, expected_phase=ASSEMBLY_PHASE_BOOTSTRAP
-        )
+        if _reuse_verified_bootstrap:
+            _require(
+                support_observer is None and asset_observer is None,
+                "verified bootstrap reuse forbids observer injection",
+            )
+            bootstrap = _session_bootstrap_snapshot(root, bootstrap_path)
+            _require(
+                bootstrap is not None,
+                "final assembly has no fresh same-session bootstrap snapshot",
+            )
+        else:
+            bootstrap = _verify_static_assembly(
+                bootstrap_path, expected_phase=ASSEMBLY_PHASE_BOOTSTRAP
+            )
+
+    if bootstrap is not None and _reuse_verified_bootstrap:
+        current_fields = _bootstrap_compatibility_fields(bootstrap)
+        source_binding = current_fields["source_binding"]
+        test_binding = current_fields["test_binding"]
+        support_binding = current_fields["support_binding"]
+        asset_binding = current_fields["asset_binding"]
+        authority_chain = current_fields["authority_chain"]
+        f2_negative = current_fields["f2_negative_evidence"]
+    else:
+        source_binding = build_source_binding(root)
+        test_binding = build_test_binding(root)
+        support_binding = build_support_binding(root, observer=support_observer)
+        asset_binding = build_asset_binding(root, observer=asset_observer)
+        authority_chain = verify_authority_chain(root)
+        f2_negative = verify_f2_negative_evidence(root)
+    _require(
+        authority_chain.get("f2_negative_evidence_payload_sha256")
+        == f2_negative.get("receipt_payload_sha256"),
+        "authority chain and assembly bind different F2 negative evidence",
+    )
+
+    if freeze_path is not None:
+        assert freeze is not None and bootstrap is not None
         current_fields = {
             "source_binding": source_binding,
             "test_binding": test_binding,
@@ -1698,6 +2007,7 @@ def _freeze_final_assembly_receipt_from_live_cal(
         root,
         phase=ASSEMBLY_PHASE_FINAL,
         lambda_adoption_freeze_path=freeze_path,
+        _reuse_verified_bootstrap=True,
     )
     file_sha = exclusive_write_json(destination, document)
     return {
@@ -1717,9 +2027,59 @@ def verify_assembly_receipt(
     support_observer: Callable[[Path], Mapping[str, Any]] | None = None,
     asset_observer: Callable[[Path], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    force_fresh = _FORCE_FRESH_ASSEMBLY_VERIFICATION.get()
+    force_token = None
+    if force_fresh:
+        # The request is one-shot.  Nested bootstrap verification performed
+        # while rebuilding a final receipt may use the current immutable
+        # snapshot; otherwise one explicit boundary would recursively force
+        # every subordinate verifier back through the 6.8-GiB ledger.
+        force_token = _FORCE_FRESH_ASSEMBLY_VERIFICATION.set(False)
+    try:
+        return _verify_assembly_receipt_impl(
+            project_root,
+            receipt_path,
+            required_phase=required_phase,
+            support_observer=support_observer,
+            asset_observer=asset_observer,
+            force_fresh=force_fresh,
+        )
+    finally:
+        if force_token is not None:
+            _FORCE_FRESH_ASSEMBLY_VERIFICATION.reset(force_token)
+
+
+def _verify_assembly_receipt_impl(
+    project_root: str | Path,
+    receipt_path: str | Path,
+    *,
+    required_phase: AssemblyPhase | None,
+    support_observer: Callable[[Path], Mapping[str, Any]] | None,
+    asset_observer: Callable[[Path], Mapping[str, Any]] | None,
+    force_fresh: bool,
+) -> dict[str, Any]:
     root = Path(project_root).expanduser().resolve()
     path = Path(receipt_path).expanduser().resolve()
     _root_relative(root, path, "assembly receipt")
+    session = _CURRENT_VERIFICATION_SESSION.get()
+    session_state: _AuthorityVerificationSessionState | None = None
+    if session is not None:
+        session_state = _verification_session_state(session, root)
+        snapshot = session_state.snapshots.get(str(path))
+        cache_eligible = support_observer is None and asset_observer is None
+        if force_fresh or not cache_eligible:
+            # Observer identity is not serializable authority.  Never satisfy
+            # an injected observation from a default-observer snapshot, and
+            # burn prior evidence before every fresh epoch so a failed rebuild
+            # cannot fall back to stale authority.
+            session_state.snapshots.pop(str(path), None)
+        if snapshot is not None and not force_fresh and cache_eligible:
+            return _verify_cached_assembly_snapshot(
+                snapshot,
+                root=root,
+                path=path,
+                required_phase=required_phase,
+            )
     document = _verify_static_assembly(path, expected_phase=required_phase)
     freeze = document.get("lambda_freeze_binding")
     freeze_path: Path | None = None
@@ -1741,7 +2101,38 @@ def verify_assembly_receipt(
         document == expected,
         "assembly receipt differs from the live fresh IBR1 authority",
     )
+    snapshot = _assembly_snapshot(root, path, document)
+    if (
+        session_state is not None
+        and support_observer is None
+        and asset_observer is None
+    ):
+        # A forced boundary rotates the exact-path snapshot only after the
+        # complete fresh verification and final receipt re-read succeeded.
+        session_state.snapshots[str(path)] = snapshot
     return document
+
+
+def _verify_assembly_receipt_fresh(
+    project_root: str | Path,
+    receipt_path: str | Path,
+    *,
+    required_phase: AssemblyPhase | None = None,
+    verifier: Callable[..., Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Force one fresh live rebuild while keeping nested verification memoized."""
+
+    if verifier is None:
+        verifier = verify_assembly_receipt
+    token = _FORCE_FRESH_ASSEMBLY_VERIFICATION.set(True)
+    try:
+        return verifier(
+            project_root,
+            receipt_path,
+            required_phase=required_phase,
+        )
+    finally:
+        _FORCE_FRESH_ASSEMBLY_VERIFICATION.reset(token)
 
 
 def _bootstrap_binding(root: Path, path: Path) -> tuple[dict[str, Any], dict[str, str]]:

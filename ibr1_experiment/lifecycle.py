@@ -38,6 +38,9 @@ from .assembly_model import (
 from .authority import (
     ASSEMBLY_PHASE_BOOTSTRAP,
     ASSEMBLY_PHASE_FINAL,
+    _VERIFICATION_SESSION_SECRET,
+    _authoritative_verification_session,
+    _verify_assembly_receipt_fresh,
     canonical_json_bytes,
     canonical_json_sha256,
     exclusive_write_json,
@@ -423,10 +426,11 @@ def _execute_smoke_plan_body(
         "smoke plan opened the internal test",
     )
     identity_receipt = plan.identity_receipt()
-    final_document = verify_assembly_receipt(
+    final_document = _verify_assembly_receipt_fresh(
         root,
         final_path,
         required_phase=ASSEMBLY_PHASE_FINAL,
+        verifier=verify_assembly_receipt,
     )
     _require(
         dict(final_document) == dict(plan.final_assembly_receipt),
@@ -568,6 +572,17 @@ def _execute_smoke_plan_body(
     )
     combined_path = output / COMBINED_GATE_FILENAME
     mechanism_pass = bool(combined.get("mechanism_pass"))
+    pre_seal_document = _verify_assembly_receipt_fresh(
+        root,
+        final_path,
+        required_phase=ASSEMBLY_PHASE_FINAL,
+        verifier=verify_assembly_receipt,
+    )
+    _require(
+        pre_seal_document == final_document
+        and pre_seal_document == dict(plan.final_assembly_receipt),
+        "final assembly authority drifted before result sealing",
+    )
     sidecar_paths = {
         f"{arm}:update{u_pre}": checkpoint_results[u_pre][arm]["sidecar"]
         for u_pre in (0, 128)
@@ -715,7 +730,7 @@ def _execute_smoke_plan(
         raise
 
 
-def run_authoritative_smoke(
+def _run_authoritative_smoke_in_verification_session(
     project_root: str | Path,
     *,
     bootstrap_receipt_path: str | Path,
@@ -743,12 +758,13 @@ def run_authoritative_smoke(
 
     # Validate the immutable bootstrap (including the inherited F2 token
     # ledger compatibility anchor) before creating any burn directory or
-    # candidate-lock evidence.  The CAL pair performs the same verification
+    # candidate-lock evidence.  The CAL pair performs another fresh check
     # immediately before worker spawn to close the remaining TOCTOU window.
-    verify_assembly_receipt(
+    _verify_assembly_receipt_fresh(
         root,
         bootstrap,
         required_phase=ASSEMBLY_PHASE_BOOTSTRAP,
+        verifier=verify_assembly_receipt,
     )
 
     stage = "create_smoke_output"
@@ -798,6 +814,31 @@ def run_authoritative_smoke(
     except BaseException as exc:
         _write_engineering_failure(smoke_output, stage=stage, error=exc)
         raise
+
+
+def run_authoritative_smoke(
+    project_root: str | Path,
+    *,
+    bootstrap_receipt_path: str | Path,
+    cal_output_dir: str | Path,
+    freeze_output_path: str | Path,
+    final_output_path: str | Path,
+    smoke_output_dir: str | Path,
+) -> dict[str, Any]:
+    """Run one authoritative lifecycle with private nested verification memoization."""
+
+    with _authoritative_verification_session(
+        _VERIFICATION_SESSION_SECRET,
+        project_root,
+    ):
+        return _run_authoritative_smoke_in_verification_session(
+            project_root,
+            bootstrap_receipt_path=bootstrap_receipt_path,
+            cal_output_dir=cal_output_dir,
+            freeze_output_path=freeze_output_path,
+            final_output_path=final_output_path,
+            smoke_output_dir=smoke_output_dir,
+        )
 
 
 __all__ = [

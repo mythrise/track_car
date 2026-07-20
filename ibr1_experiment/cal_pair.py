@@ -485,6 +485,10 @@ def consume_final_authority_capability(
         and attestation.get("parent_pid") == os.getpid(),
         "final authority capability root/path/parent process drifted",
     )
+    # The capability was minted only after a fresh final post-write check in
+    # this same parent/session.  Re-read the immutable receipt bytes here and
+    # consume that registered evidence; the production data loader performs
+    # the next full token-ledger traversal before execution.
     document = authority.verify_assembly_receipt(
         root,
         final_path,
@@ -661,7 +665,7 @@ def _build_freeze_from_live_proof(proof: _LivePairProof) -> dict[str, Any]:
     )
 
 
-def _run_live_cal_pair_and_freeze(
+def _run_live_cal_pair_and_freeze_in_session(
     project_root: str | Path,
     *,
     bootstrap_receipt_path: str | Path,
@@ -695,7 +699,7 @@ def _run_live_cal_pair_and_freeze(
     _require(not output.exists(), "live CAL pair output directory must be fresh")
     _require(not freeze_output.exists(), "lambda freeze output already exists")
     _require(not final_output.exists(), "final assembly output already exists")
-    bootstrap_document = authority.verify_assembly_receipt(
+    bootstrap_document = authority._verify_assembly_receipt_fresh(
         root,
         bootstrap,
         required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
@@ -727,6 +731,17 @@ def _run_live_cal_pair_and_freeze(
         "main and reproduction live Popen PIDs are identical",
     )
 
+    post_worker_bootstrap = authority._verify_assembly_receipt_fresh(
+        root,
+        bootstrap,
+        required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+    )
+    _require(
+        post_worker_bootstrap == bootstrap_document,
+        "bootstrap authority/source/assets drifted while CAL workers ran",
+    )
+    bootstrap_document = post_worker_bootstrap
+
     forensic = authority.verify_cal_pair(
         root,
         main_raw_f2_kernel_path=role_paths["main"]["raw"],
@@ -741,6 +756,16 @@ def _run_live_cal_pair_and_freeze(
         reproduction_execution_witness_path=role_paths["reproduction"]["witness"],
         bootstrap_receipt_path=bootstrap,
     )
+    post_forensic_bootstrap = authority._verify_assembly_receipt_fresh(
+        root,
+        bootstrap,
+        required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+    )
+    _require(
+        post_forensic_bootstrap == bootstrap_document,
+        "bootstrap authority/source/assets drifted during CAL pair verification",
+    )
+    bootstrap_document = post_forensic_bootstrap
     source_sha = bootstrap_document["source_binding"]["ibr1_source_sha256"]
     attestation = {
         "schema_version": 1,
@@ -802,7 +827,7 @@ def _run_live_cal_pair_and_freeze(
         lambda_adoption_freeze_path=freeze_output,
         live_pair_proof=proof,
     )
-    authority.verify_assembly_receipt(
+    authority._verify_assembly_receipt_fresh(
         root,
         final_output,
         required_phase=authority.ASSEMBLY_PHASE_FINAL,
@@ -833,6 +858,33 @@ def _run_live_cal_pair_and_freeze(
         "authority_eligible": True,
         "formal_training_authorized": False,
     }
+
+
+def _run_live_cal_pair_and_freeze(
+    project_root: str | Path,
+    *,
+    bootstrap_receipt_path: str | Path,
+    output_dir: str | Path,
+    freeze_output_path: str | Path,
+    final_output_path: str | Path,
+    popen_factory: Callable[..., Any],
+    _authority_secret: object | None = None,
+) -> dict[str, Any]:
+    """Run one pair inside a private same-parent verification session."""
+
+    with authority._authoritative_verification_session(
+        authority._VERIFICATION_SESSION_SECRET,
+        project_root,
+    ):
+        return _run_live_cal_pair_and_freeze_in_session(
+            project_root,
+            bootstrap_receipt_path=bootstrap_receipt_path,
+            output_dir=output_dir,
+            freeze_output_path=freeze_output_path,
+            final_output_path=final_output_path,
+            popen_factory=popen_factory,
+            _authority_secret=_authority_secret,
+        )
 
 
 def run_live_cal_pair_and_freeze(
