@@ -2272,8 +2272,10 @@ def _receipt_base_hf_path(
 def build_ibr1_production_smoke_plan(
     project_root: str | Path,
     final_assembly_receipt_path: str | Path,
+    *,
+    final_authority_capability: Any = None,
 ) -> IBR1SmokePlan:
-    """Build the fixed seed-0/cuda:0 IBR1 smoke plan and stop before run."""
+    """Build the fixed seed-0/cuda:0 plan from one live consumed capability."""
 
     root = Path(project_root).expanduser().resolve()
     receipt_path = Path(final_assembly_receipt_path).expanduser().resolve()
@@ -2285,6 +2287,16 @@ def build_ibr1_production_smoke_plan(
     )
     _validate_final_receipt(document)
     receipt_binding = _final_receipt_binding(root, receipt_path, document)
+
+    # A final receipt file is forensic evidence, not a runnable authority.
+    # Burn the exact same-process continuation before loading data or weights.
+    from .cal_pair import claim_consumed_final_authority_for_smoke
+
+    claim_consumed_final_authority_for_smoke(
+        final_authority_capability,
+        project_root=root,
+        final_receipt_path=receipt_path,
+    )
 
     # The base loader may allocate enough host/GPU memory to obscure an
     # invalid CPU fallback.  Reject the unsupported platform immediately

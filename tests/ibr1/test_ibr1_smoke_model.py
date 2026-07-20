@@ -843,6 +843,7 @@ def test_component_rejects_double_optimizer_hook_wiring(tmp_path: Path):
 
 def test_production_cpu_fails_before_base_loader(tmp_path: Path, monkeypatch):
     from ibr1_experiment import smoke_model
+    from ibr1_experiment import cal_pair
 
     receipt_path = tmp_path / "final.json"
     receipt_path.write_text("{}", encoding="utf-8")
@@ -864,15 +865,47 @@ def test_production_cpu_fails_before_base_loader(tmp_path: Path, monkeypatch):
         "load_ibr1_smoke_data",
         lambda *args, **kwargs: calls.append("data") or _data(),
     )
+    capability = object()
+    monkeypatch.setattr(
+        cal_pair,
+        "claim_consumed_final_authority_for_smoke",
+        lambda observed, **kwargs: (
+            None
+            if observed is capability
+            else pytest.fail(f"wrong capability: {observed!r}, {kwargs!r}")
+        ),
+    )
     with pytest.raises(IBR1SmokeContractError, match="requires CUDA"):
-        build_ibr1_production_smoke_plan(tmp_path, receipt_path)
+        build_ibr1_production_smoke_plan(
+            tmp_path,
+            receipt_path,
+            final_authority_capability=capability,
+        )
     assert calls == []
+
+
+def test_production_rejects_file_only_final_receipt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from ibr1_experiment import smoke_model
+    from ibr1_experiment.cal_pair import IBR1CalPairError
+
+    receipt_path = tmp_path / "final.json"
+    receipt_path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        smoke_model,
+        "verify_assembly_receipt",
+        lambda *args, **kwargs: _receipt(),
+    )
+    with pytest.raises(IBR1CalPairError, match="freshly consumed"):
+        build_ibr1_production_smoke_plan(tmp_path, receipt_path)
 
 
 def test_mocked_production_success_uses_fixed_authority_context(
     tmp_path: Path, monkeypatch
 ):
     from ibr1_experiment import smoke_model
+    from ibr1_experiment import cal_pair
 
     receipt_path = tmp_path / "final.json"
     receipt_path.write_text("{}", encoding="utf-8")
@@ -958,8 +991,22 @@ def test_mocked_production_success_uses_fixed_authority_context(
         "_build_ibr1_smoke_plan_from_components",
         build_components,
     )
+    capability = object()
+    monkeypatch.setattr(
+        cal_pair,
+        "claim_consumed_final_authority_for_smoke",
+        lambda observed, **kwargs: (
+            None
+            if observed is capability
+            else pytest.fail(f"wrong capability: {observed!r}, {kwargs!r}")
+        ),
+    )
 
-    result = build_ibr1_production_smoke_plan(tmp_path, receipt_path)
+    result = build_ibr1_production_smoke_plan(
+        tmp_path,
+        receipt_path,
+        final_authority_capability=capability,
+    )
     assert result is sentinel
     assert calls == [
         "verify",
@@ -1023,6 +1070,7 @@ def test_production_rejects_fake_data_without_loader_provenance(
     tmp_path: Path, monkeypatch
 ):
     from ibr1_experiment import smoke_model
+    from ibr1_experiment import cal_pair
 
     receipt_path = tmp_path / "final.json"
     receipt_path.write_text("{}", encoding="utf-8")
@@ -1052,8 +1100,22 @@ def test_production_rejects_fake_data_without_loader_provenance(
         "load_base_checkpoint",
         lambda *args: base_calls.append("base"),
     )
+    capability = object()
+    monkeypatch.setattr(
+        cal_pair,
+        "claim_consumed_final_authority_for_smoke",
+        lambda observed, **kwargs: (
+            None
+            if observed is capability
+            else pytest.fail(f"wrong capability: {observed!r}, {kwargs!r}")
+        ),
+    )
     with pytest.raises(IBR1SmokeContractError, match="loader provenance"):
-        build_ibr1_production_smoke_plan(tmp_path, receipt_path)
+        build_ibr1_production_smoke_plan(
+            tmp_path,
+            receipt_path,
+            final_authority_capability=capability,
+        )
     assert base_calls == []
 
 
@@ -1061,6 +1123,7 @@ def test_production_rejects_reset_drift_after_frozen_loading(
     tmp_path: Path, monkeypatch
 ):
     from ibr1_experiment import smoke_model
+    from ibr1_experiment import cal_pair
 
     receipt_path = tmp_path / "final.json"
     receipt_path.write_text("{}", encoding="utf-8")
@@ -1103,5 +1166,19 @@ def test_production_rejects_reset_drift_after_frozen_loading(
     monkeypatch.setattr(
         smoke_model, "load_ibr1_smoke_data", lambda *args: drifted
     )
+    capability = object()
+    monkeypatch.setattr(
+        cal_pair,
+        "claim_consumed_final_authority_for_smoke",
+        lambda observed, **kwargs: (
+            None
+            if observed is capability
+            else pytest.fail(f"wrong capability: {observed!r}, {kwargs!r}")
+        ),
+    )
     with pytest.raises(IBR1SmokeContractError, match="reset sets drifted"):
-        build_ibr1_production_smoke_plan(tmp_path, receipt_path)
+        build_ibr1_production_smoke_plan(
+            tmp_path,
+            receipt_path,
+            final_authority_capability=capability,
+        )

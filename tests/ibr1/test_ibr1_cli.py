@@ -103,6 +103,10 @@ def test_pre_torch_environment_rejects_conflicting_cublas(
 def test_runtime_configures_determinism_before_any_cuda_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The full IBR1 suite imports torch in other test modules before this
+    # unit test is collected.  Model the valid already-established CLI
+    # environment so this order-only test does not depend on module order.
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", cli.CUBLAS_WORKSPACE_CONFIG)
     events: list[str] = []
     state = {"initialized": False, "configured": False}
 
@@ -295,6 +299,69 @@ def test_live_cal_pair_uses_fixed_parent_orchestrator_after_cuda_guard(
     payload = json.loads(capsys.readouterr().out)
     assert payload["authority_eligible"] is True
     assert "final_authority_capability" not in payload
+    assert payload["formal_training_authorized"] is False
+
+
+def test_run_smoke_dispatches_one_parent_lifecycle_after_cuda_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    events: list[Any] = []
+    monkeypatch.setattr(
+        cli,
+        "_configure_runtime",
+        lambda *, require_cuda: events.append(("runtime", require_cuda))
+        or _runtime(),
+    )
+
+    def run_smoke(root: Path, **kwargs: Any) -> dict[str, Any]:
+        events.append(("run_smoke", root, kwargs))
+        return {
+            "analysis_class": "ibr1_authoritative_smoke_summary",
+            "mechanism_pass": False,
+            "decision": "SEAL_STOP",
+            "formal_training_authorized": False,
+        }
+
+    lifecycle = SimpleNamespace(run_authoritative_smoke=run_smoke)
+    monkeypatch.setattr(
+        cli,
+        "_import_module",
+        lambda name: events.append(("import", name)) or lifecycle,
+    )
+    assert (
+        cli.main(
+            [
+                "run-smoke",
+                "--project-root",
+                str(PROJECT_ROOT),
+                "--bootstrap-receipt",
+                "bootstrap.json",
+                "--cal-output-dir",
+                "cal",
+                "--freeze-output",
+                "freeze.json",
+                "--final-output",
+                "final.json",
+                "--smoke-output-dir",
+                "smoke",
+            ]
+        )
+        == 0
+    )
+    assert events[0] == ("runtime", True)
+    assert events[1] == ("import", "ibr1_experiment.lifecycle")
+    assert events[2][0] == "run_smoke"
+    assert events[2][2] == {
+        "bootstrap_receipt_path": "bootstrap.json",
+        "cal_output_dir": "cal",
+        "freeze_output_path": "freeze.json",
+        "final_output_path": "final.json",
+        "smoke_output_dir": "smoke",
+    }
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["runtime"]["device"] == "cuda:0"
+    assert payload["decision"] == "SEAL_STOP"
     assert payload["formal_training_authorized"] is False
 
 

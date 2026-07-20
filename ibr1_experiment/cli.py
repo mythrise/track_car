@@ -113,6 +113,14 @@ def build_parser() -> argparse.ArgumentParser:
     cal_pair.add_argument("--freeze-output", required=True)
     cal_pair.add_argument("--final-output", required=True)
 
+    smoke = subparsers.add_parser("run-smoke")
+    smoke.add_argument("--project-root", default=".")
+    smoke.add_argument("--bootstrap-receipt", required=True)
+    smoke.add_argument("--cal-output-dir", required=True)
+    smoke.add_argument("--freeze-output", required=True)
+    smoke.add_argument("--final-output", required=True)
+    smoke.add_argument("--smoke-output-dir", required=True)
+
     verify = subparsers.add_parser("verify-assembly")
     verify.add_argument("--project-root", default=".")
     verify.add_argument("--receipt", required=True)
@@ -137,6 +145,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     require_cuda = args.command != "verify-assembly"
     runtime = _configure_runtime(require_cuda=require_cuda)
     root = Path(args.project_root).expanduser().resolve()
+
+    if args.command == "run-smoke":
+        lifecycle = _import_module("ibr1_experiment.lifecycle")
+        result = lifecycle.run_authoritative_smoke(
+            root,
+            bootstrap_receipt_path=args.bootstrap_receipt,
+            cal_output_dir=args.cal_output_dir,
+            freeze_output_path=args.freeze_output,
+            final_output_path=args.final_output,
+            smoke_output_dir=args.smoke_output_dir,
+        )
+        _print_result(
+            {
+                **result,
+                "runtime": runtime,
+                "formal_training_authorized": False,
+            }
+        )
+        return 0
 
     if args.command == "run-cal-pair":
         cal_pair = _import_module("ibr1_experiment.cal_pair")

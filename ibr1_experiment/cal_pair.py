@@ -9,6 +9,7 @@ call that writes the lambda-adoption freeze.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 import secrets
 import subprocess
 from typing import Any
+from weakref import WeakKeyDictionary
 
 from . import authority
 from .runtime_contract import (
@@ -49,6 +51,22 @@ _LIVE_PROOF_SECRET = object()
 _FINAL_CAPABILITY_SECRET = object()
 _AUTHORITATIVE_RUN_SECRET = object()
 _OFFICIAL_POPEN = subprocess.Popen
+
+
+@dataclass(slots=True)
+class _FinalCapabilityState:
+    root: Path
+    freeze_path: Path
+    final_path: Path
+    final_binding_bytes: bytes
+    attestation_bytes: bytes
+    consumed: bool = False
+    smoke_claimed: bool = False
+
+
+_FINAL_CAPABILITY_REGISTRY: WeakKeyDictionary[
+    Any, _FinalCapabilityState
+] = WeakKeyDictionary()
 
 
 class IBR1CalPairError(authority.IBR1AuthorityError):
@@ -275,6 +293,7 @@ def _run_worker(
 
 class _LivePairProof:
     __slots__ = (
+        "__weakref__",
         "_secret",
         "root",
         "freeze_path",
@@ -314,6 +333,7 @@ class FinalAuthorityCapability:
     """One-process, one-use continuation from live CAL/final into production."""
 
     __slots__ = (
+        "__weakref__",
         "_secret",
         "_root",
         "_freeze_path",
@@ -321,6 +341,7 @@ class FinalAuthorityCapability:
         "_final_binding",
         "_attestation",
         "_consumed",
+        "_smoke_claimed",
     )
 
     def __init__(
@@ -344,12 +365,50 @@ class FinalAuthorityCapability:
         self._final_binding = dict(final_binding)
         self._attestation = dict(attestation)
         self._consumed = False
+        self._smoke_claimed = False
 
     def __reduce__(self) -> Any:
         raise TypeError("final authority capability is intentionally non-serializable")
 
     def __getstate__(self) -> Any:
         raise TypeError("final authority capability is intentionally non-serializable")
+
+
+def _mint_final_authority_capability(
+    secret: object,
+    *,
+    root: Path,
+    freeze_path: Path,
+    final_path: Path,
+    final_binding: Mapping[str, str],
+    attestation: Mapping[str, Any],
+) -> FinalAuthorityCapability:
+    """Mint the only registry-backed continuation from a successful live run."""
+
+    _require(
+        secret is _FINAL_CAPABILITY_SECRET,
+        "final authority capability mint is private",
+    )
+    capability = FinalAuthorityCapability(
+        secret,
+        root=root,
+        freeze_path=freeze_path,
+        final_path=final_path,
+        final_binding=final_binding,
+        attestation=attestation,
+    )
+    _FINAL_CAPABILITY_REGISTRY[capability] = _FinalCapabilityState(
+        root=root,
+        freeze_path=freeze_path,
+        final_path=final_path,
+        final_binding_bytes=authority.canonical_json_bytes(
+            dict(final_binding)
+        ),
+        attestation_bytes=authority.canonical_json_bytes(
+            dict(attestation)
+        ),
+    )
+    return capability
 
 
 def _consume_live_pair_proof_for_final(
@@ -402,19 +461,28 @@ def consume_final_authority_capability(
 ) -> dict[str, Any]:
     """Consume the real in-memory continuation for a production lifecycle."""
 
+    state = (
+        _FINAL_CAPABILITY_REGISTRY.get(capability)
+        if type(capability) is FinalAuthorityCapability
+        else None
+    )
     _require(
         type(capability) is FinalAuthorityCapability
-        and capability._secret is _FINAL_CAPABILITY_SECRET
-        and capability._consumed is False,
+        and state is not None
+        and state.consumed is False,
         "production lifecycle requires one fresh final authority capability",
     )
+    assert state is not None
+    final_binding = json.loads(state.final_binding_bytes.decode("utf-8"))
+    attestation = json.loads(state.attestation_bytes.decode("utf-8"))
     capability._consumed = True
+    state.consumed = True
     root = Path(project_root).expanduser().resolve()
     final_path = Path(final_receipt_path).expanduser().resolve()
     _require(
-        root == capability._root
-        and final_path == capability._final_path
-        and capability._attestation.get("parent_pid") == os.getpid(),
+        root == state.root
+        and final_path == state.final_path
+        and attestation.get("parent_pid") == os.getpid(),
         "final authority capability root/path/parent process drifted",
     )
     document = authority.verify_assembly_receipt(
@@ -430,22 +498,90 @@ def consume_final_authority_capability(
         "phase": authority.ASSEMBLY_PHASE_FINAL,
     }
     _require(
-        observed_binding == capability._final_binding,
+        observed_binding == final_binding,
         "final authority capability receipt bytes drifted",
     )
-    workers = capability._attestation.get("workers")
+    workers = attestation.get("workers")
     _require(isinstance(workers, Mapping), "final authority capability workers malformed")
     return {
         "analysis_class": "ibr1_final_authority_live_capability",
         "final_assembly_receipt": observed_binding,
-        "lambda_adoption_freeze_path": str(capability._freeze_path),
-        "parent_pid": capability._attestation["parent_pid"],
-        "parent_challenge": capability._attestation["parent_challenge"],
+        "lambda_adoption_freeze_path": str(state.freeze_path),
+        "parent_pid": attestation["parent_pid"],
+        "parent_challenge": attestation["parent_challenge"],
         "worker_pids": {
             role: workers[role]["pid"] for role in ("main", "reproduction")
         },
         "authority_eligible": True,
         "formal_training_authorized": False,
+    }
+
+
+def claim_consumed_final_authority_for_smoke(
+    capability: FinalAuthorityCapability,
+    *,
+    project_root: str | Path,
+    final_receipt_path: str | Path,
+) -> dict[str, Any]:
+    """Burn the consumed live continuation when constructing the smoke plan.
+
+    A final receipt on disk is deliberately insufficient.  The production
+    smoke plan must receive the exact non-serializable object that the same
+    parent process just consumed, and that object can authorize one plan only.
+    """
+
+    state = (
+        _FINAL_CAPABILITY_REGISTRY.get(capability)
+        if type(capability) is FinalAuthorityCapability
+        else None
+    )
+    _require(
+        type(capability) is FinalAuthorityCapability
+        and state is not None
+        and state.consumed is True
+        and state.smoke_claimed is False,
+        "production smoke plan requires the freshly consumed final authority "
+        "capability",
+    )
+    assert state is not None
+    final_binding = json.loads(state.final_binding_bytes.decode("utf-8"))
+    attestation = json.loads(state.attestation_bytes.decode("utf-8"))
+    capability._smoke_claimed = True
+    state.smoke_claimed = True
+    root = Path(project_root).expanduser().resolve()
+    final_path = Path(final_receipt_path).expanduser().resolve()
+    _require(
+        root == state.root
+        and final_path == state.final_path
+        and attestation.get("parent_pid") == os.getpid(),
+        "consumed final authority capability root/path/parent process drifted",
+    )
+    document = authority.verify_assembly_receipt(
+        root,
+        final_path,
+        required_phase=authority.ASSEMBLY_PHASE_FINAL,
+    )
+    observed_binding = {
+        "path": str(final_path),
+        "sha256": hashlib.sha256(final_path.read_bytes()).hexdigest(),
+        "receipt_payload_sha256": document["receipt_payload_sha256"],
+        "analysis_class": authority.ASSEMBLY_RECEIPT_CLASS,
+        "phase": authority.ASSEMBLY_PHASE_FINAL,
+    }
+    _require(
+        observed_binding == final_binding,
+        "consumed final authority capability receipt bytes drifted",
+    )
+    return {
+        "analysis_class": "ibr1_consumed_final_authority_smoke_claim",
+        "final_assembly_receipt": observed_binding,
+        "parent_pid": attestation["parent_pid"],
+        "parent_challenge": attestation["parent_challenge"],
+        "authority_eligible": True,
+        "single_use": True,
+        "formal_training_authorized": False,
+        "internal_test": authority.INTERNAL_TEST_POLICY,
+        "internal_test_opened": False,
     }
 
 
@@ -676,7 +812,7 @@ def _run_live_cal_pair_and_freeze(
         proof.stage == "final_consumed",
         "live CAL proof was not consumed exactly once by final assembly",
     )
-    final_capability = FinalAuthorityCapability(
+    final_capability = _mint_final_authority_capability(
         _FINAL_CAPABILITY_SECRET,
         root=root,
         freeze_path=freeze_output,
@@ -724,6 +860,7 @@ def run_live_cal_pair_and_freeze(
 __all__ = [
     "FinalAuthorityCapability",
     "IBR1CalPairError",
+    "claim_consumed_final_authority_for_smoke",
     "consume_final_authority_capability",
     "run_live_cal_pair_and_freeze",
 ]
