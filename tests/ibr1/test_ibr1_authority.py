@@ -1220,6 +1220,107 @@ def test_final_issue_and_repeated_transition_verification_keep_constant_ledger_c
         assert ledger_calls == 2
 
 
+def test_cached_receipt_failure_burns_snapshot_before_aba_restore(
+    tmp_path: Path,
+    support_observation: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _clone_receipt_project(tmp_path / "project")
+    bootstrap_path, bootstrap = _freeze_bootstrap(root, support_observation)
+    assets = copy.deepcopy(bootstrap["asset_binding"]["observation"])
+    monkeypatch.setattr(
+        authority,
+        "_default_support_observer",
+        lambda _root: copy.deepcopy(support_observation),
+    )
+    monkeypatch.setattr(
+        authority,
+        "verify_frozen_assets",
+        lambda _root, verify_token_payload=False: copy.deepcopy(assets),
+    )
+    ledger_calls = 0
+
+    def counted_ledger(_root: Path) -> SimpleNamespace:
+        nonlocal ledger_calls
+        ledger_calls += 1
+        return SimpleNamespace(
+            ledger_sha256=assets["token_ledger_sha256"],
+            token_files=assets["token_ledger_file_count"],
+        )
+
+    monkeypatch.setattr(authority, "build_train_token_ledger", counted_ledger)
+    original_bytes = bootstrap_path.read_bytes()
+
+    with authority._authoritative_verification_session(
+        authority._VERIFICATION_SESSION_SECRET,
+        root,
+    ):
+        authority._verify_assembly_receipt_fresh(
+            root,
+            bootstrap_path,
+            required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+        )
+        assert ledger_calls == 1
+
+        bootstrap_path.write_bytes(original_bytes + b"\n")
+        try:
+            with pytest.raises(authority.IBR1AuthorityError):
+                authority.verify_assembly_receipt(
+                    root,
+                    bootstrap_path,
+                    required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+                )
+        finally:
+            bootstrap_path.write_bytes(original_bytes)
+
+        authority.verify_assembly_receipt(
+            root,
+            bootstrap_path,
+            required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+        )
+        assert ledger_calls == 2
+
+        bootstrap_binding = authority._receipt_binding(
+            root, bootstrap_path, bootstrap
+        )
+        freeze_path = root / "experiments/windows_cuda_ibr1/fake_live_freeze.json"
+        freeze = _rehash(
+            {
+                "schema_version": 1,
+                "analysis_class": authority.LAMBDA_ADOPTION_FREEZE_CLASS,
+                "evidence": {"bootstrap_assembly_receipt": bootstrap_binding},
+                "formal_training_authorized": False,
+                "internal_test": "sealed",
+                "internal_test_opened": False,
+            }
+        )
+        _write_canonical(freeze_path, freeze)
+        monkeypatch.setattr(
+            authority,
+            "verify_lambda_adoption_freeze",
+            lambda _root, _path: copy.deepcopy(freeze),
+        )
+
+        bootstrap_path.write_bytes(original_bytes + b"\n")
+        try:
+            with pytest.raises(authority.IBR1AuthorityError):
+                authority._build_assembly_receipt_document(
+                    root,
+                    phase=authority.ASSEMBLY_PHASE_FINAL,
+                    lambda_adoption_freeze_path=freeze_path,
+                    _reuse_verified_bootstrap=True,
+                )
+        finally:
+            bootstrap_path.write_bytes(original_bytes)
+
+        authority.verify_assembly_receipt(
+            root,
+            bootstrap_path,
+            required_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+        )
+        assert ledger_calls == 3
+
+
 def test_private_session_is_fail_closed_on_drift_observer_swap_and_context_replay(
     tmp_path: Path,
     support_observation: dict[str, Any],

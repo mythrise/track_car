@@ -721,12 +721,19 @@ def _session_bootstrap_snapshot(
     snapshot = state.snapshots.get(str(path))
     if snapshot is None or snapshot.phase != ASSEMBLY_PHASE_BOOTSTRAP:
         return None
-    return _verify_cached_assembly_snapshot(
-        snapshot,
-        root=root,
-        path=path,
-        required_phase=ASSEMBLY_PHASE_BOOTSTRAP,
-    )
+    try:
+        return _verify_cached_assembly_snapshot(
+            snapshot,
+            root=root,
+            path=path,
+            required_phase=ASSEMBLY_PHASE_BOOTSTRAP,
+        )
+    except BaseException:
+        # Final issuance is another cache consumer.  It must burn failed
+        # bootstrap evidence just like the public verifier so an ABA restore
+        # cannot revive the pre-failure snapshot.
+        state.snapshots.pop(str(path), None)
+        raise
 
 
 def exclusive_write_json(path: str | Path, value: Any) -> str:
@@ -2074,12 +2081,19 @@ def _verify_assembly_receipt_impl(
             # cannot fall back to stale authority.
             session_state.snapshots.pop(str(path), None)
         if snapshot is not None and not force_fresh and cache_eligible:
-            return _verify_cached_assembly_snapshot(
-                snapshot,
-                root=root,
-                path=path,
-                required_phase=required_phase,
-            )
+            try:
+                return _verify_cached_assembly_snapshot(
+                    snapshot,
+                    root=root,
+                    path=path,
+                    required_phase=required_phase,
+                )
+            except BaseException:
+                # A failed byte/static check invalidates the cached evidence.
+                # In particular, an ABA restore must not let a caller reuse
+                # the pre-failure snapshot without another full live rebuild.
+                session_state.snapshots.pop(str(path), None)
+                raise
     document = _verify_static_assembly(path, expected_phase=required_phase)
     freeze = document.get("lambda_freeze_binding")
     freeze_path: Path | None = None
