@@ -89,8 +89,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         prepare_cublas_workspace_config()
         import torch
 
-        runtime = require_official_torch_cuda(torch)
+        # Device discovery/selection initializes real CUDA.  Freeze the
+        # deterministic policy first, while torch.cuda.is_initialized() is
+        # still false, then validate and select the official cuda:0 device.
         configure_cuda_reproducibility(torch)
+        runtime = require_official_torch_cuda(torch)
 
         # Import only after cuBLAS and CUDA policy establishment.
         from .calibration import run_ibr1_cal_audit_once
