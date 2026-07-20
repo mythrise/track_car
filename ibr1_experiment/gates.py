@@ -35,7 +35,10 @@ from f2_experiment.evaluation import (
     evaluate_g8,
     evaluate_g9,
 )
+from f2_experiment.assembly import EVAL_MODE_CONTRACT
+from f2_experiment.controller import DEFAULT_CONFIG
 from f2_experiment.model import ARCHITECTURE_LOCK as F2_ARCHITECTURE_LOCK
+from f2_experiment.support import SUPPORT_EXPECTATIONS
 
 from .assembly_model import (
     FAMILY_TO_ENGINE_ARM,
@@ -90,6 +93,14 @@ IBR1_NEGATIVE_SEAL_CLASS = "ibr1_authoritative_smoke_negative_result_seal"
 IBR1_SEAL_SCHEMA_VERSION = 1
 F2_COUNT_RECEIPT_CLASS = "f2_paired_runner_count_receipt"
 F2_EVAL_PHASE_RECEIPT_CLASS = "f2_eval_fix_snapshot_receipt"
+
+# These values are protocol constants, not fields supplied by a runner.  Keep
+# private copies of the frozen F2 sources so a receipt cannot redefine the
+# reset accounting or silently introduce a new controller/EVAL contract.
+_FROZEN_SMOKE_STATIC_RESETS = SUPPORT_EXPECTATIONS["SMK-TRAIN"].static_resets
+_FROZEN_EVAL_STATIC_RESETS = SUPPORT_EXPECTATIONS["EVAL-FIX"].static_resets
+_FROZEN_CONTROLLER_CONFIG = deepcopy(DEFAULT_CONFIG.to_dict())
+_FROZEN_EVAL_MODE_CONTRACT = deepcopy(EVAL_MODE_CONTRACT)
 
 # The preregistered EVAL-FIX raw-row strata, expressed as inclusive position
 # ranges in the frozen 512-row order.  These values are derived from the
@@ -2879,9 +2890,13 @@ def _count_receipt_artifact(
         and document.get("loss") == "L_aux+0.5*L1+0.5*L2",
         "paired runner count receipt frozen run contract drifted",
     )
-    expected_static_resets = _nonnegative_int(
-        document.get("expected_static_resets"),
-        "paired runner expected static resets",
+    _require(
+        _nonnegative_int(
+            document.get("expected_static_resets"),
+            "paired runner expected static resets",
+        )
+        == _FROZEN_SMOKE_STATIC_RESETS,
+        "paired runner expected static resets differ from frozen SMK-TRAIN count",
     )
     arms = _mapping(document.get("arms"), "paired runner count receipt arms")
     _require(set(arms) == {"S-CTRL", "S-SELF"}, "paired runner count receipt arm set drifted")
@@ -2914,7 +2929,7 @@ def _count_receipt_artifact(
         "backward_calls": 256,
         "optimizer_steps": 128,
         "controller_steps": 256,
-        "static_resets": expected_static_resets,
+        "static_resets": _FROZEN_SMOKE_STATIC_RESETS,
         "nonfinite_resets": 0,
         "branch1_logged_rows": 256,
         "g7_updates": 128,
@@ -3059,8 +3074,6 @@ def _eval_phase_receipt_artifacts(
     summaries: dict[str, dict[str, Any]] = {}
     resolved_paths: set[Path] = set()
     reference_counts: dict[str, int] | None = None
-    reference_controller: Mapping[str, Any] | None = None
-    reference_eval_contract: Mapping[str, Any] | None = None
     for phase_name, phase in expected_phases.items():
         path = _rooted_path(project_root, values[phase_name], f"EVAL phase receipt {phase_name}")
         _require(path not in resolved_paths, "EVAL phase receipt paths must be distinct")
@@ -3119,17 +3132,29 @@ def _eval_phase_receipt_artifacts(
         _require(set(resets) == {"expected", "observed"}, f"EVAL phase {phase_name} reset schema drifted")
         expected_resets = _nonnegative_int(resets.get("expected"), f"EVAL phase {phase_name} expected resets")
         observed_resets = _nonnegative_int(resets.get("observed"), f"EVAL phase {phase_name} observed resets")
-        _require(expected_resets == observed_resets, f"EVAL phase {phase_name} static resets drifted")
+        _require(
+            expected_resets == _FROZEN_EVAL_STATIC_RESETS
+            and observed_resets == _FROZEN_EVAL_STATIC_RESETS,
+            f"EVAL phase {phase_name} static resets differ from frozen EVAL-FIX count",
+        )
         controller = _mapping(document.get("controller_config"), f"EVAL phase {phase_name} controller config")
         eval_contract = _mapping(document.get("eval_mode_contract"), f"EVAL phase {phase_name} mode contract")
-        _canonical(controller, f"EVAL phase {phase_name} controller config")
-        _canonical(eval_contract, f"EVAL phase {phase_name} mode contract")
-        if reference_controller is None:
-            reference_controller = controller
-            reference_eval_contract = eval_contract
-        else:
-            _require(dict(controller) == dict(reference_controller), "EVAL phase controller configs differ")
-            _require(dict(eval_contract) == dict(reference_eval_contract), "EVAL phase mode contracts differ")
+        _require(
+            _canonical(controller, f"EVAL phase {phase_name} controller config")
+            == _canonical(
+                _FROZEN_CONTROLLER_CONFIG,
+                "frozen F2 controller config",
+            ),
+            f"EVAL phase {phase_name} controller config differs from frozen DEFAULT_CONFIG",
+        )
+        _require(
+            _canonical(eval_contract, f"EVAL phase {phase_name} mode contract")
+            == _canonical(
+                _FROZEN_EVAL_MODE_CONTRACT,
+                "frozen F2 EVAL mode contract",
+            ),
+            f"EVAL phase {phase_name} mode contract differs from frozen EVAL_MODE_CONTRACT",
+        )
         losses_value = document.get("row_losses")
         _require(_is_sequence(losses_value) and len(losses_value) == FROZEN_EVAL_ROWS, f"EVAL phase {phase_name} row-loss cardinality drifted")
         row_losses = tuple(

@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from f2_experiment.assembly import EVAL_MODE_CONTRACT
+from f2_experiment.controller import DEFAULT_CONFIG
 from f2_experiment.model import ARCHITECTURE_LOCK as F2_ARCHITECTURE_LOCK
 
 from ibr1_experiment.assembly_model import (
@@ -818,7 +820,7 @@ def _count_receipt(tensor_sha: str) -> dict[str, object]:
         "backward_calls": 256,
         "optimizer_steps": 128,
         "controller_steps": 256,
-        "static_resets": 3,
+        "static_resets": 12,
         "nonfinite_resets": 0,
         "branch1_logged_rows": 256,
         "g7_updates": 128,
@@ -836,7 +838,7 @@ def _count_receipt(tensor_sha: str) -> dict[str, object]:
         "grad_accum": 2,
         "warmup": "u_pre<16",
         "loss": "L_aux+0.5*L1+0.5*L2",
-        "expected_static_resets": 3,
+        "expected_static_resets": 12,
         "arms": {
             "S-CTRL": {
                 **common,
@@ -889,9 +891,9 @@ def _eval_phase_receipt(phase_name: str, mode: str) -> dict[str, object]:
         "support": "EVAL-FIX",
         "rows": 512,
         "mode": mode,
-        "static_resets": {"expected": 3, "observed": 3},
-        "controller_config": {"frozen": True},
-        "eval_mode_contract": {"support": "EVAL-FIX"},
+        "static_resets": {"expected": 28, "observed": 28},
+        "controller_config": DEFAULT_CONFIG.to_dict(),
+        "eval_mode_contract": deepcopy(EVAL_MODE_CONTRACT),
         "row_losses": row_losses,
         "summary": summary,
     }
@@ -1236,6 +1238,78 @@ def test_seal_builder_rejects_checkpoint_and_diagnostics_bundle_pocs(
     sha_drift["artifacts"]["training_geometry.jsonl"]["sha256"] = "0" * 64
     _write(manifest_path, _rehash(sha_drift))
     with pytest.raises(IBR1GateContractError, match="SHA drifted"):
+        build_ibr1_negative_result_seal(tmp_path, **artifacts)
+
+
+@pytest.mark.parametrize("arm", ["S-CTRL", "S-SELF"])
+def test_count_receipt_static_resets_are_frozen_to_smk_train(
+    tmp_path: Path,
+    arm: str,
+) -> None:
+    artifacts = _seal_artifacts(tmp_path, passed=False)
+    count_path = Path(artifacts["count_receipt_path"])
+    baseline = json.loads(count_path.read_bytes())
+
+    self_reported_drift = deepcopy(baseline)
+    self_reported_drift["expected_static_resets"] = 11
+    for counts in self_reported_drift["arms"].values():
+        counts["static_resets"] = 11
+    _write(count_path, self_reported_drift)
+    with pytest.raises(
+        IBR1GateContractError,
+        match="frozen SMK-TRAIN count",
+    ):
+        build_ibr1_negative_result_seal(tmp_path, **artifacts)
+
+    arm_drift = deepcopy(baseline)
+    arm_drift["arms"][arm]["static_resets"] = 11
+    _write(count_path, arm_drift)
+    with pytest.raises(
+        IBR1GateContractError,
+        match=rf"paired runner {arm}\.static_resets drifted",
+    ):
+        build_ibr1_negative_result_seal(tmp_path, **artifacts)
+
+
+def test_eval_phase_runtime_contracts_reject_six_consistently_drifted_receipts(
+    tmp_path: Path,
+) -> None:
+    artifacts = _seal_artifacts(tmp_path, passed=False)
+    phase_paths = artifacts["eval_phase_receipt_paths"]
+    assert isinstance(phase_paths, dict)
+    baselines = {
+        phase_name: json.loads(Path(path).read_bytes())
+        for phase_name, path in phase_paths.items()
+    }
+
+    for phase_name, path in phase_paths.items():
+        document = deepcopy(baselines[phase_name])
+        document["static_resets"] = {"expected": 29, "observed": 29}
+        _write(Path(path), document)
+    with pytest.raises(
+        IBR1GateContractError,
+        match="frozen EVAL-FIX count",
+    ):
+        build_ibr1_negative_result_seal(tmp_path, **artifacts)
+
+    for phase_name, path in phase_paths.items():
+        document = deepcopy(baselines[phase_name])
+        document["controller_config"]["max_abs"] = 0.75
+        _write(Path(path), document)
+    with pytest.raises(
+        IBR1GateContractError,
+        match="frozen DEFAULT_CONFIG",
+    ):
+        build_ibr1_negative_result_seal(tmp_path, **artifacts)
+
+    for phase_name, path in phase_paths.items():
+        document = deepcopy(baselines[phase_name])
+        document["eval_mode_contract"]["grad"] = "drifted"
+        _write(Path(path), document)
+    with pytest.raises(
+        IBR1GateContractError,
+        match="frozen EVAL_MODE_CONTRACT",
+    ):
         build_ibr1_negative_result_seal(tmp_path, **artifacts)
 
 
