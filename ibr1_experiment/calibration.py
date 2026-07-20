@@ -22,7 +22,7 @@ from statistics import median
 import sys
 import threading
 import time
-from types import ModuleType
+from types import FunctionType, ModuleType
 from typing import Any, Literal
 
 import f2_experiment.assembly as f2_assembly
@@ -62,6 +62,10 @@ _INTERPRETER_REGISTRY_NAME = (
 _PRODUCTION_BINDING_REGISTRY_NAME = (
     "_ibr1_calibration_production_binding_77b5aab8e59a42f7a4973b4320cbf6e4"
 )
+_PRODUCTION_METHOD_BINDING_REGISTRY_NAME = (
+    "_ibr1_calibration_production_method_binding_"
+    "d30dcad57bd74f98a56e21e8f65a10cb"
+)
 TEST_ONLY_EVIDENCE_CLASS = "ibr1_cal_test_only_evidence"
 TEST_ONLY_EVIDENCE_FILENAME = "ibr1_cal_test_only_evidence.json"
 PARENT_CHALLENGE_ENV = "IBR1_CAL_PARENT_CHALLENGE"
@@ -82,6 +86,41 @@ _TRUSTED_CALIBRATION_MODEL_BINDING: tuple[
     Any,
     type[Any],
 ] | None = getattr(builtins, _PRODUCTION_BINDING_REGISTRY_NAME, None)
+
+_DirectMethodBinding = tuple[str, FunctionType, Any, str, str]
+_DirectMethodBindings = tuple[_DirectMethodBinding, ...]
+_IBR1_AUDITOR_DIRECT_METHOD_NAMES = frozenset(
+    {
+        "__init__",
+        "_assert_init_binding",
+        "context_receipt",
+        "_ibr1_geometry",
+        "__call__",
+    }
+)
+_F2_AUDITOR_DIRECT_METHOD_NAMES = frozenset(
+    {"__init__", "context_receipt", "_probe_grad_norm", "__call__"}
+)
+_TRUSTED_AUDITOR_METHOD_BINDING: tuple[
+    ModuleType,
+    Path,
+    type[Any],
+    _DirectMethodBindings,
+    ModuleType,
+    Path,
+    type[Any],
+    _DirectMethodBindings,
+] | None = getattr(builtins, _PRODUCTION_METHOD_BINDING_REGISTRY_NAME, None)
+if (
+    isinstance(_TRUSTED_AUDITOR_METHOD_BINDING, tuple)
+    and len(_TRUSTED_AUDITOR_METHOD_BINDING) == 8
+):
+    # Preserve the first registered F2 class/module objects across lifecycle
+    # reloads instead of silently trusting whatever mutable module attributes
+    # happen to exist at reload time.
+    _TRUSTED_F2_MODEL_MODULE = _TRUSTED_AUDITOR_METHOD_BINDING[4]
+    _TRUSTED_F2_MODEL_MODULE_FILE = _TRUSTED_AUDITOR_METHOD_BINDING[5]
+    _TRUSTED_F2_AUDITOR_CLASS = _TRUSTED_AUDITOR_METHOD_BINDING[6]
 
 
 class IBR1CalibrationContractError(authority.IBR1AuthorityError):
@@ -574,6 +613,110 @@ def _require_class_binding(
     )
 
 
+def _capture_direct_method_bindings(
+    auditor_class: type[Any],
+    *,
+    module: ModuleType,
+    module_file: Path,
+    expected_names: frozenset[str],
+    label: str,
+) -> _DirectMethodBindings:
+    """Seal every method defined directly on one production auditor class."""
+
+    bound_file = _module_file(module, module_file, label)
+    direct_methods = {
+        name: value
+        for name, value in vars(auditor_class).items()
+        if isinstance(value, FunctionType)
+    }
+    _require(
+        frozenset(direct_methods) == expected_names,
+        f"{label} direct method surface is malformed at registration",
+    )
+    bindings: list[_DirectMethodBinding] = []
+    for name in sorted(expected_names):
+        method = direct_methods[name]
+        code = getattr(method, "__code__", None)
+        module_name = getattr(method, "__module__", None)
+        qualname = getattr(method, "__qualname__", None)
+        _require(
+            code is not None
+            and module_name == module.__name__
+            and qualname == f"{auditor_class.__qualname__}.{name}"
+            and getattr(method, "__globals__", None) is vars(module)
+            and isinstance(getattr(code, "co_filename", None), str)
+            and Path(code.co_filename).resolve() == bound_file,
+            f"{label}.{name} code/module/file binding is malformed at registration",
+        )
+        bindings.append((name, method, code, module_name, qualname))
+    return tuple(bindings)
+
+
+def _require_direct_method_bindings(
+    actual_class: type[Any],
+    *,
+    expected_class: type[Any],
+    bindings: _DirectMethodBindings,
+    module: ModuleType,
+    module_file: Path,
+    expected_names: frozenset[str],
+    source_sha256: str,
+    label: str,
+) -> None:
+    """Fail closed if a registered direct method changed in memory or on disk."""
+
+    bound_file = _module_file(module, module_file, label)
+    _require(
+        actual_class is expected_class
+        and _sha256_file(bound_file, label) == source_sha256,
+        f"{label} identity drifted: real class/module binding changed",
+    )
+    expected_bindings = {name: rest for name, *rest in bindings}
+    current_direct_methods = {
+        name: value
+        for name, value in vars(actual_class).items()
+        if isinstance(value, FunctionType)
+    }
+    _require(
+        frozenset(expected_bindings) == expected_names
+        and frozenset(current_direct_methods) == expected_names,
+        f"{label} direct method surface drifted",
+    )
+    for name in sorted(expected_names):
+        expected_method, expected_code, module_name, qualname = expected_bindings[name]
+        actual_method = vars(actual_class).get(name)
+        actual_code = getattr(actual_method, "__code__", None)
+        _require(
+            actual_method is expected_method
+            and getattr(actual_class, name, None) is actual_method
+            and actual_code is expected_code
+            and getattr(actual_method, "__module__", None) == module_name
+            and module_name == module.__name__
+            and getattr(actual_method, "__qualname__", None) == qualname
+            and qualname == f"{actual_class.__qualname__}.{name}"
+            and getattr(actual_method, "__globals__", None) is vars(module)
+            and isinstance(getattr(actual_code, "co_filename", None), str)
+            and Path(actual_code.co_filename).resolve() == bound_file,
+            f"{label}.{name} identity drifted: "
+            "real method/code/module/file binding changed",
+        )
+
+
+def _require_no_direct_method_shadow(
+    instance: Any,
+    *,
+    bindings: _DirectMethodBindings,
+    label: str,
+) -> None:
+    namespace = getattr(instance, "__dict__", None)
+    _require(isinstance(namespace, dict), f"{label} instance namespace is malformed")
+    method_names = {binding[0] for binding in bindings}
+    _require(
+        method_names.isdisjoint(namespace),
+        f"{label} instance shadows a registered direct method",
+    )
+
+
 def _bind_production_calibration_model_components(
     module: ModuleType,
     auditor_factory: Callable[[Path], Any],
@@ -581,9 +724,10 @@ def _bind_production_calibration_model_components(
 ) -> None:
     """Capture model-side production objects once their circular import completes."""
 
-    global _TRUSTED_CALIBRATION_MODEL_BINDING
+    global _TRUSTED_AUDITOR_METHOD_BINDING, _TRUSTED_CALIBRATION_MODEL_BINDING
     _require(
-        _TRUSTED_CALIBRATION_MODEL_BINDING is None,
+        _TRUSTED_CALIBRATION_MODEL_BINDING is None
+        and _TRUSTED_AUDITOR_METHOD_BINDING is None,
         "IBR1 CAL production model components were registered twice",
     )
     module_file_text = getattr(module, "__file__", None)
@@ -604,6 +748,20 @@ def _bind_production_calibration_model_components(
         and Path(code.co_filename).resolve() == module_file,
         "IBR1 CAL production factory code/module binding is malformed",
     )
+    ibr1_method_bindings = _capture_direct_method_bindings(
+        auditor_class,
+        module=module,
+        module_file=module_file,
+        expected_names=_IBR1_AUDITOR_DIRECT_METHOD_NAMES,
+        label="production IBR1 CAL auditor class",
+    )
+    f2_method_bindings = _capture_direct_method_bindings(
+        _TRUSTED_F2_AUDITOR_CLASS,
+        module=_TRUSTED_F2_MODEL_MODULE,
+        module_file=_TRUSTED_F2_MODEL_MODULE_FILE,
+        expected_names=_F2_AUDITOR_DIRECT_METHOD_NAMES,
+        label="production F2 CAL auditor class",
+    )
     _TRUSTED_CALIBRATION_MODEL_BINDING = (
         module,
         module_file,
@@ -611,10 +769,25 @@ def _bind_production_calibration_model_components(
         code,
         auditor_class,
     )
+    _TRUSTED_AUDITOR_METHOD_BINDING = (
+        module,
+        module_file,
+        auditor_class,
+        ibr1_method_bindings,
+        _TRUSTED_F2_MODEL_MODULE,
+        _TRUSTED_F2_MODEL_MODULE_FILE,
+        _TRUSTED_F2_AUDITOR_CLASS,
+        f2_method_bindings,
+    )
     setattr(
         builtins,
         _PRODUCTION_BINDING_REGISTRY_NAME,
         _TRUSTED_CALIBRATION_MODEL_BINDING,
+    )
+    setattr(
+        builtins,
+        _PRODUCTION_METHOD_BINDING_REGISTRY_NAME,
+        _TRUSTED_AUDITOR_METHOD_BINDING,
     )
 
 
@@ -644,9 +817,16 @@ def _resolve_production_components(
     from . import calibration_model
 
     binding = _TRUSTED_CALIBRATION_MODEL_BINDING
+    method_binding = _TRUSTED_AUDITOR_METHOD_BINDING
     _require(
         binding is not None and binding[0] is calibration_model,
         "IBR1 CAL production model components were not identity-bound at import",
+    )
+    _require(
+        isinstance(method_binding, tuple)
+        and len(method_binding) == 8
+        and method_binding[0] is calibration_model,
+        "IBR1 CAL production auditor methods were not identity-bound at import",
     )
     (
         calibration_model_module,
@@ -655,6 +835,25 @@ def _resolve_production_components(
         trusted_auditor_factory_code,
         trusted_auditor_class,
     ) = binding
+    (
+        method_calibration_model_module,
+        method_calibration_model_file,
+        method_auditor_class,
+        trusted_ibr1_method_bindings,
+        method_f2_model_module,
+        method_f2_model_file,
+        method_f2_auditor_class,
+        trusted_f2_method_bindings,
+    ) = method_binding
+    _require(
+        method_calibration_model_module is calibration_model_module
+        and method_calibration_model_file == calibration_model_file
+        and method_auditor_class is trusted_auditor_class
+        and method_f2_model_module is _TRUSTED_F2_MODEL_MODULE
+        and method_f2_model_file == _TRUSTED_F2_MODEL_MODULE_FILE
+        and method_f2_auditor_class is _TRUSTED_F2_AUDITOR_CLASS,
+        "IBR1 CAL registered class/method authority is internally inconsistent",
+    )
     subordinate_runner = f2_assembly.run_cal_audit
     auditor_factory = calibration_model.build_ibr1_cal_row_auditor
     auditor_class = calibration_model.IBR1ModelCalRowAuditor
@@ -705,12 +904,32 @@ def _resolve_production_components(
         source_sha256=calibration_model_sha,
         label="production IBR1 CAL auditor class",
     )
+    _require_direct_method_bindings(
+        auditor_class,
+        expected_class=method_auditor_class,
+        bindings=trusted_ibr1_method_bindings,
+        module=method_calibration_model_module,
+        module_file=method_calibration_model_file,
+        expected_names=_IBR1_AUDITOR_DIRECT_METHOD_NAMES,
+        source_sha256=calibration_model_sha,
+        label="production IBR1 CAL auditor class",
+    )
     _require_class_binding(
         f2_assembly_model.CalRowAuditor,
-        expected=_TRUSTED_F2_AUDITOR_CLASS,
-        module=_TRUSTED_F2_MODEL_MODULE,
-        module_file=_TRUSTED_F2_MODEL_MODULE_FILE,
+        expected=method_f2_auditor_class,
+        module=method_f2_model_module,
+        module_file=method_f2_model_file,
         attribute="CalRowAuditor",
+        source_sha256=f2_model_sha,
+        label="production F2 CAL auditor class",
+    )
+    _require_direct_method_bindings(
+        f2_assembly_model.CalRowAuditor,
+        expected_class=method_f2_auditor_class,
+        bindings=trusted_f2_method_bindings,
+        module=method_f2_model_module,
+        module_file=method_f2_model_file,
+        expected_names=_F2_AUDITOR_DIRECT_METHOD_NAMES,
         source_sha256=f2_model_sha,
         label="production F2 CAL auditor class",
     )
@@ -816,10 +1035,36 @@ def run_ibr1_cal_audit_once(
         type(ibr1_row_auditor.subordinate_auditor) is _TRUSTED_F2_AUDITOR_CLASS,
         "production IBR1 CAL factory returned a non-F2 subordinate auditor",
     )
-    context_provider = getattr(ibr1_row_auditor, "context_receipt", None)
+    method_binding = _TRUSTED_AUDITOR_METHOD_BINDING
     _require(
-        callable(context_provider),
-        "production IBR1 row auditor has no context_receipt",
+        isinstance(method_binding, tuple) and len(method_binding) == 8,
+        "production CAL auditor method binding disappeared after construction",
+    )
+    trusted_ibr1_method_bindings = method_binding[3]
+    trusted_f2_method_bindings = method_binding[7]
+    _require_no_direct_method_shadow(
+        ibr1_row_auditor,
+        bindings=trusted_ibr1_method_bindings,
+        label="production IBR1 CAL auditor",
+    )
+    _require_no_direct_method_shadow(
+        ibr1_row_auditor.subordinate_auditor,
+        bindings=trusted_f2_method_bindings,
+        label="production F2 CAL auditor",
+    )
+    trusted_ibr1_methods = {
+        binding[0]: binding[1] for binding in trusted_ibr1_method_bindings
+    }
+    context_provider = trusted_ibr1_methods["context_receipt"].__get__(
+        ibr1_row_auditor,
+        auditor_class,
+    )
+    _require(
+        callable(context_provider)
+        and getattr(context_provider, "__self__", None) is ibr1_row_auditor
+        and getattr(context_provider, "__func__", None)
+        is trusted_ibr1_methods["context_receipt"],
+        "production IBR1 row auditor context_receipt binding drifted",
     )
 
     callback_positions: list[int] = []
@@ -847,7 +1092,13 @@ def run_ibr1_cal_audit_once(
             "subordinate CAL callback clock is not ordered 0..511 exactly",
         )
         audit = _validate_row_audit(
-            ibr1_row_auditor(row, reasons, position), position
+            trusted_ibr1_methods["__call__"](
+                ibr1_row_auditor,
+                row,
+                reasons,
+                position,
+            ),
+            position,
         )
         callback_positions.append(position)
         row_audits.append(audit)

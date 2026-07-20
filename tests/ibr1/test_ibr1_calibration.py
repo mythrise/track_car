@@ -16,6 +16,7 @@ import pytest
 import torch
 
 import f2_experiment.assembly as f2_assembly
+import f2_experiment.assembly_model as f2_assembly_model
 from f2_experiment.assembly import CalRowAudit
 
 import ibr1_experiment.authority as authority
@@ -390,6 +391,105 @@ def test_public_path_rejects_spoofed_model_component_metadata(
 
     output = tmp_path / f"spoofed_{target}"
     with pytest.raises(module.IBR1CalibrationContractError, match="identity drifted"):
+        module.run_ibr1_cal_audit_once(
+            tmp_path,
+            role="main",
+            bootstrap_receipt_path=bootstrap_path,
+            output_dir=output,
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("auditor", "method_name"),
+    [
+        ("ibr1", "__init__"),
+        ("ibr1", "_assert_init_binding"),
+        ("ibr1", "context_receipt"),
+        ("ibr1", "_ibr1_geometry"),
+        ("ibr1", "__call__"),
+        ("f2", "__init__"),
+        ("f2", "context_receipt"),
+        ("f2", "_probe_grad_norm"),
+        ("f2", "__call__"),
+    ],
+)
+def test_public_path_rejects_replaced_direct_auditor_method(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auditor: str,
+    method_name: str,
+) -> None:
+    module = _fresh_module()
+    bootstrap_path = tmp_path / "bootstrap.json"
+    bootstrap_path.write_text("{}", encoding="utf-8")
+    bootstrap = _fake_bootstrap(module, bootstrap_path)
+    monkeypatch.setattr(
+        authority,
+        "verify_assembly_receipt",
+        lambda *_args, **_kwargs: copy.deepcopy(bootstrap),
+    )
+    auditor_class = (
+        calibration_model.IBR1ModelCalRowAuditor
+        if auditor == "ibr1"
+        else f2_assembly_model.CalRowAuditor
+    )
+    original_method = vars(auditor_class)[method_name]
+
+    def spoofed_method(*_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+    spoofed_method.__name__ = original_method.__name__
+    spoofed_method.__module__ = original_method.__module__
+    spoofed_method.__qualname__ = original_method.__qualname__
+    monkeypatch.setattr(auditor_class, method_name, spoofed_method)
+
+    output = tmp_path / f"replaced_{auditor}_{method_name}"
+    with pytest.raises(
+        module.IBR1CalibrationContractError,
+        match="real method/code/module/file binding changed",
+    ):
+        module.run_ibr1_cal_audit_once(
+            tmp_path,
+            role="main",
+            bootstrap_receipt_path=bootstrap_path,
+            output_dir=output,
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("auditor", ["ibr1", "f2"])
+def test_public_path_rejects_in_place_auditor_call_code_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auditor: str,
+) -> None:
+    module = _fresh_module()
+    bootstrap_path = tmp_path / "bootstrap.json"
+    bootstrap_path.write_text("{}", encoding="utf-8")
+    bootstrap = _fake_bootstrap(module, bootstrap_path)
+    monkeypatch.setattr(
+        authority,
+        "verify_assembly_receipt",
+        lambda *_args, **_kwargs: copy.deepcopy(bootstrap),
+    )
+    auditor_class = (
+        calibration_model.IBR1ModelCalRowAuditor
+        if auditor == "ibr1"
+        else f2_assembly_model.CalRowAuditor
+    )
+    call_method = vars(auditor_class)["__call__"]
+
+    def spoofed_call(*_args: Any, **_kwargs: Any) -> object:
+        return object()
+
+    monkeypatch.setattr(call_method, "__code__", spoofed_call.__code__)
+
+    output = tmp_path / f"replaced_{auditor}_call_code"
+    with pytest.raises(
+        module.IBR1CalibrationContractError,
+        match="real method/code/module/file binding changed",
+    ):
         module.run_ibr1_cal_audit_once(
             tmp_path,
             role="main",
