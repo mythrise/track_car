@@ -937,6 +937,29 @@ def test_static_bootstrap_rejects_divergent_token_ledger_compatibility_anchor(
         )
 
 
+def test_static_bootstrap_rejects_equal_numeric_token_ledger_count_type_drift(
+    tmp_path: Path,
+    support_observation: dict[str, Any],
+) -> None:
+    root = _clone_receipt_project(tmp_path / "project")
+    path, bootstrap = _freeze_bootstrap(root, support_observation)
+    bootstrap["asset_binding"]["observation"][
+        "token_ledger_file_count"
+    ] = 36_946.0
+    bootstrap["asset_binding"] = _rehash(bootstrap["asset_binding"])
+    bootstrap = _rehash(bootstrap)
+    _write_canonical(path, bootstrap)
+
+    with pytest.raises(
+        authority.IBR1AuthorityError,
+        match="observation token ledger cardinality drifted",
+    ):
+        authority._verify_static_assembly(
+            path,
+            expected_phase=authority.ASSEMBLY_PHASE_BOOTSTRAP,
+        )
+
+
 def test_cal_execution_binding_single_field_drift_is_rejected(
     tmp_path: Path,
     support_observation: dict[str, Any],
@@ -1671,3 +1694,20 @@ def test_full_payload_reread_and_internal_open_fail_closed(
             support_observer=_support_observer(support_observation),
             asset_observer=lambda _root: observed,
         )
+
+
+@pytest.mark.parametrize(
+    "ledger_file_count",
+    [36_946.0, True, "36946"],
+    ids=["float", "bool", "string"],
+)
+def test_asset_binding_rejects_non_exact_token_ledger_file_count_type(
+    tmp_path: Path,
+    ledger_file_count: Any,
+) -> None:
+    root = tmp_path / "project"
+    observed = _asset_observation(root)
+    observed["token_ledger_file_count"] = ledger_file_count
+
+    with pytest.raises(authority.IBR1AuthorityError, match="cardinality drifted"):
+        authority.build_asset_binding(root, observer=lambda _root: observed)

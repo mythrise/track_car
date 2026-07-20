@@ -1328,8 +1328,10 @@ def _validate_asset_observation(observed: Mapping[str, Any]) -> None:
         "prompt erratum identity drifted",
     )
     _valid_sha256(observed.get("token_ledger_sha256"), "token ledger SHA")
+    ledger_file_count = observed.get("token_ledger_file_count")
     _require(
-        observed.get("token_ledger_file_count") == FROZEN_TRAIN_TOKEN_FILES,
+        type(ledger_file_count) is int
+        and ledger_file_count == FROZEN_TRAIN_TOKEN_FILES,
         "train-split token ledger cardinality drifted",
     )
 
@@ -1346,7 +1348,7 @@ def build_asset_binding(
     _require(isinstance(observed, Mapping), "asset observer returned no mapping")
     _validate_asset_observation(observed)
     ledger_sha = str(observed["token_ledger_sha256"])
-    ledger_file_count = int(observed["token_ledger_file_count"])
+    ledger_file_count = observed["token_ledger_file_count"]
     return _with_payload_self_hash(
         {
             "schema_version": 1,
@@ -1433,14 +1435,20 @@ def _verify_asset_ledger_anchor(binding: Mapping[str, Any]) -> None:
     )
     ledger_file_count = binding.get("token_ledger_file_count")
     _require(
-        isinstance(ledger_file_count, int)
-        and not isinstance(ledger_file_count, bool)
+        type(ledger_file_count) is int
         and ledger_file_count == FROZEN_TRAIN_TOKEN_FILES,
         "assembly asset token ledger cardinality drifted",
     )
+    observed_ledger_file_count = observation.get("token_ledger_file_count")
+    _require(
+        type(observed_ledger_file_count) is int
+        and observed_ledger_file_count == FROZEN_TRAIN_TOKEN_FILES,
+        "assembly asset observation token ledger cardinality drifted",
+    )
     _require(
         observation.get("token_ledger_sha256") == ledger_sha
-        and observation.get("token_ledger_file_count") == ledger_file_count,
+        and type(observed_ledger_file_count) is type(ledger_file_count)
+        and observed_ledger_file_count == ledger_file_count,
         "assembly asset token ledger compatibility anchor differs from "
         "the verified IBR1 observation",
     )
