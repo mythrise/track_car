@@ -9,7 +9,7 @@ scientific PASS/FAIL seal.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 import hashlib
 import json
 import os
@@ -51,6 +51,8 @@ from .checkpoint import save_ibr1_arm_checkpoint
 from .eval_guard import IBR1_EVAL_PHASES, IBR1EvalOrderGuard, IBR1EvalPhase
 from .gates import (
     IBR1_GATE_IDS,
+    build_ibr1_negative_result_seal,
+    build_ibr1_pass_seal,
     build_ibr1_combined_gate_receipt,
     evaluate_i1,
     evaluate_i2,
@@ -61,8 +63,6 @@ from .gates import (
     freeze_ibr1_candidate_lock_receipt,
     freeze_ibr1_combined_gate_receipt,
     freeze_ibr1_gate_receipt,
-    freeze_ibr1_negative_result_seal,
-    freeze_ibr1_pass_seal,
 )
 from .model import IBR1_ARCHITECTURE_LOCK, IBR1_FAMILY_ID
 from .smoke_model import IBR1SmokePlan, build_ibr1_production_smoke_plan
@@ -191,6 +191,10 @@ def _write_engineering_failure(
     path = output / ENGINEERING_FAILURE_FILENAME
     if path.exists():
         return
+    result_seal_written = any(
+        (output / filename).exists()
+        for filename in (PASS_SEAL_FILENAME, NEGATIVE_SEAL_FILENAME)
+    )
     document = _self_hashed(
         {
             "schema_version": 1,
@@ -204,7 +208,7 @@ def _write_engineering_failure(
                 traceback.format_exception(type(error), error, error.__traceback__)
             ),
             "valid_scientific_result": False,
-            "result_seal_written": False,
+            "result_seal_written": result_seal_written,
             "rerun_requires_fresh_output_directory": True,
             "formal_training_authorized": False,
             "internal_test": "sealed",
@@ -398,7 +402,7 @@ def _write_gates(
     return combined, paths, documents
 
 
-def _execute_smoke_plan(
+def _execute_smoke_plan_body(
     root: Path,
     output: Path,
     *,
@@ -408,6 +412,7 @@ def _execute_smoke_plan(
     cal_output: Path,
     cal_result: Mapping[str, Any],
     live_authority: Mapping[str, Any],
+    close_plan: Callable[[], None],
 ) -> dict[str, Any]:
     _require(plan.production_context, "IBR1 smoke plan is not production-bound")
     _require(plan.authority_eligible, "IBR1 smoke plan is not authority-eligible")
@@ -486,8 +491,9 @@ def _execute_smoke_plan(
     )
     gradient_document, optimizer_document = plan.gradient_collector.finalize()
     # Hook cleanup is part of engineering validity and must succeed before a
-    # scientific gate or result seal is allowed to exist.
-    plan.close()
+    # scientific gate, summary, or result seal is allowed to exist.  The
+    # wrapper owns the once-only call so early failures are cleaned up too.
+    close_plan()
     checkpoint_identity = {
         "verified": True,
         "targets": {
@@ -581,11 +587,19 @@ def _execute_smoke_plan(
         PASS_SEAL_FILENAME if mechanism_pass else NEGATIVE_SEAL_FILENAME
     )
     if mechanism_pass:
-        seal_result = freeze_ibr1_pass_seal(root, seal_path, **seal_kwargs)
+        seal_document = build_ibr1_pass_seal(root, **seal_kwargs)
     else:
-        seal_result = freeze_ibr1_negative_result_seal(
-            root, seal_path, **seal_kwargs
-        )
+        seal_document = build_ibr1_negative_result_seal(root, **seal_kwargs)
+    seal_result = {
+        "path": _relative(root, seal_path),
+        "sha256": hashlib.sha256(
+            canonical_json_bytes(seal_document) + b"\n"
+        ).hexdigest(),
+        "analysis_class": seal_document["analysis_class"],
+        "receipt_payload_sha256": seal_document["receipt_payload_sha256"],
+        "mechanism_pass": mechanism_pass,
+        "formal_training_authorized": False,
+    }
 
     printable_cal_result = {
         key: value
@@ -641,7 +655,7 @@ def _execute_smoke_plan(
     )
     summary_path = output / SMOKE_SUMMARY_FILENAME
     summary_sha = exclusive_write_json(summary_path, summary)
-    return {
+    result = {
         "path": str(summary_path),
         "sha256": summary_sha,
         "receipt_payload_sha256": summary["receipt_payload_sha256"],
@@ -654,6 +668,50 @@ def _execute_smoke_plan(
         "internal_test": "sealed",
         "internal_test_opened": False,
     }
+    # This is deliberately the final authoritative write.  Every cleanup,
+    # artifact validation/build, and summary write has already succeeded, and
+    # exclusive_write_json removes a partial file if its write/fsync fails.
+    exclusive_write_json(seal_path, seal_document)
+    return result
+
+
+def _execute_smoke_plan(
+    root: Path,
+    output: Path,
+    *,
+    plan: IBR1SmokePlan,
+    candidate_lock_path: Path,
+    final_path: Path,
+    cal_output: Path,
+    cal_result: Mapping[str, Any],
+    live_authority: Mapping[str, Any],
+) -> dict[str, Any]:
+    closed = False
+
+    def close_plan() -> None:
+        nonlocal closed
+        if closed:
+            return
+        closed = True
+        plan.close()
+
+    try:
+        return _execute_smoke_plan_body(
+            root,
+            output,
+            plan=plan,
+            candidate_lock_path=candidate_lock_path,
+            final_path=final_path,
+            cal_output=cal_output,
+            cal_result=cal_result,
+            live_authority=live_authority,
+            close_plan=close_plan,
+        )
+    except BaseException:
+        # Early execution failures still clean up hooks, while failures after
+        # the explicit close point never trigger a second close attempt.
+        close_plan()
+        raise
 
 
 def run_authoritative_smoke(
@@ -716,19 +774,16 @@ def run_authoritative_smoke(
         )
         _require(isinstance(plan, IBR1SmokePlan), "plan builder returned no IBR1 plan")
         stage = "execute_authoritative_smoke"
-        try:
-            return _execute_smoke_plan(
-                root,
-                smoke_output,
-                plan=plan,
-                candidate_lock_path=candidate_lock_path,
-                final_path=final_output,
-                cal_output=cal_output,
-                cal_result=cal_result,
-                live_authority=live_authority,
-            )
-        finally:
-            plan.close()
+        return _execute_smoke_plan(
+            root,
+            smoke_output,
+            plan=plan,
+            candidate_lock_path=candidate_lock_path,
+            final_path=final_output,
+            cal_output=cal_output,
+            cal_result=cal_result,
+            live_authority=live_authority,
+        )
     except BaseException as exc:
         _write_engineering_failure(smoke_output, stage=stage, error=exc)
         raise

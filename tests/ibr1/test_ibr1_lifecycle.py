@@ -167,6 +167,7 @@ def test_live_cal_capability_and_plan_stay_in_one_parent_call(
         events.append(("execute", root, output, kwargs))
         assert kwargs["plan"] is plan
         assert kwargs["live_authority"]["formal_training_authorized"] is False
+        kwargs["plan"].close()
         return {
             "analysis_class": "fake_smoke_summary",
             "formal_training_authorized": False,
@@ -231,6 +232,30 @@ def test_engineering_failure_burns_directory_without_result_seal(
     assert not (paths["smoke"] / lifecycle.SMOKE_SUMMARY_FILENAME).exists()
     assert not (paths["smoke"] / lifecycle.PASS_SEAL_FILENAME).exists()
     assert not (paths["smoke"] / lifecycle.NEGATIVE_SEAL_FILENAME).exists()
+
+
+def test_engineering_failure_marker_reports_existing_result_seal(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "smoke"
+    output.mkdir()
+    exclusive_write_json(
+        output / lifecycle.PASS_SEAL_FILENAME,
+        {"analysis_class": "test_preexisting_result_seal"},
+    )
+
+    lifecycle._write_engineering_failure(
+        output,
+        stage="test_post_seal_failure",
+        error=RuntimeError("post-seal failure"),
+    )
+
+    failure = json.loads(
+        (output / lifecycle.ENGINEERING_FAILURE_FILENAME).read_text(
+            encoding="utf-8"
+        )
+    )
+    assert failure["result_seal_written"] is True
 
 
 def test_existing_output_fails_before_live_cal(
@@ -341,8 +366,21 @@ def test_capability_registry_ignores_writable_slot_replay(
         )
 
 
-def test_execute_plan_uses_frozen_six_eval_phase_order(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "failure_mode",
+    (None, "summary_write", "close"),
+    ids=("success", "summary-write-failure", "close-failure"),
+)
+@pytest.mark.parametrize(
+    "mechanism_pass",
+    (True, False),
+    ids=("pass-seal", "negative-seal"),
+)
+def test_execute_plan_seals_only_after_close_and_summary_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str | None,
+    mechanism_pass: bool,
 ) -> None:
     output = tmp_path / "smoke"
     output.mkdir()
@@ -359,6 +397,20 @@ def test_execute_plan_uses_frozen_six_eval_phase_order(
     (cal_output / "main").mkdir(parents=True)
 
     phase_order: list[str] = []
+    finalization_events: list[str] = []
+    write_json = lifecycle.exclusive_write_json
+
+    def ordered_write(path: str | Path, value: Any) -> str:
+        filename = Path(path).name
+        finalization_events.append(filename)
+        if (
+            failure_mode == "summary_write"
+            and filename == lifecycle.SMOKE_SUMMARY_FILENAME
+        ):
+            raise OSError("summary write failed")
+        return write_json(path, value)
+
+    monkeypatch.setattr(lifecycle, "exclusive_write_json", ordered_write)
 
     class FakeCollector:
         def __init__(self, value: Any) -> None:
@@ -402,7 +454,9 @@ def test_execute_plan_uses_frozen_six_eval_phase_order(
 
         @staticmethod
         def close() -> None:
-            return None
+            finalization_events.append("plan.close")
+            if failure_mode == "close":
+                raise RuntimeError("plan close failed")
 
     fake_plan = FakePlan()
 
@@ -482,38 +536,85 @@ def test_execute_plan_uses_frozen_six_eval_phase_order(
         paths: dict[str, Path] = {}
         documents: dict[str, dict[str, Any]] = {}
         for gate_id in lifecycle.IBR1_GATE_IDS:
-            document = {"analysis_class": "ibr1_gate_receipt", "passed": True}
+            document = {
+                "analysis_class": "ibr1_gate_receipt",
+                "passed": mechanism_pass,
+            }
             path = output / f"gate_{gate_id}.json"
             exclusive_write_json(path, document)
             paths[gate_id] = path
             documents[gate_id] = document
-        combined = {"analysis_class": "ibr1_combined_gate_receipt", "mechanism_pass": True}
+        combined = {
+            "analysis_class": "ibr1_combined_gate_receipt",
+            "mechanism_pass": mechanism_pass,
+        }
         exclusive_write_json(output / lifecycle.COMBINED_GATE_FILENAME, combined)
         return combined, paths, documents
 
     monkeypatch.setattr(lifecycle, "_write_gates", gates)
+    seal_document = {
+        "analysis_class": (
+            "ibr1_authoritative_smoke_pass_seal"
+            if mechanism_pass
+            else "ibr1_authoritative_smoke_negative_result_seal"
+        ),
+        "receipt_payload_sha256": "d" * 64,
+        "formal_training_authorized": False,
+    }
     monkeypatch.setattr(
         lifecycle,
-        "freeze_ibr1_pass_seal",
+        (
+            "build_ibr1_pass_seal"
+            if mechanism_pass
+            else "build_ibr1_negative_result_seal"
+        ),
         lambda *args, **kwargs: {
-            "analysis_class": "ibr1_pass_seal",
-            "formal_training_authorized": False,
+            **seal_document,
+            "receipt_payload_sha256": "d" * 64,
         },
     )
 
-    result = lifecycle._execute_smoke_plan(
-        tmp_path,
-        output,
-        plan=fake_plan,
-        candidate_lock_path=candidate_lock,
-        final_path=final_path,
-        cal_output=cal_output,
-        cal_result={"final_authority_capability": object()},
-        live_authority={"formal_training_authorized": False},
-    )
+    def execute() -> dict[str, Any]:
+        return lifecycle._execute_smoke_plan(
+            tmp_path,
+            output,
+            plan=fake_plan,
+            candidate_lock_path=candidate_lock,
+            final_path=final_path,
+            cal_output=cal_output,
+            cal_result={"final_authority_capability": object()},
+            live_authority={"formal_training_authorized": False},
+        )
+
+    if failure_mode == "summary_write":
+        with pytest.raises(OSError, match="summary write failed"):
+            execute()
+    elif failure_mode == "close":
+        with pytest.raises(RuntimeError, match="plan close failed"):
+            execute()
+    else:
+        result = execute()
 
     assert phase_order == [phase.phase for phase in IBR1_EVAL_PHASES]
-    assert result["mechanism_pass"] is True
+    assert finalization_events.count("plan.close") == 1
+    expected_seal = (
+        lifecycle.PASS_SEAL_FILENAME
+        if mechanism_pass
+        else lifecycle.NEGATIVE_SEAL_FILENAME
+    )
+    if failure_mode is not None:
+        assert not (output / lifecycle.PASS_SEAL_FILENAME).exists()
+        assert not (output / lifecycle.NEGATIVE_SEAL_FILENAME).exists()
+        assert not (output / lifecycle.SMOKE_SUMMARY_FILENAME).exists()
+        return
+
+    assert result["mechanism_pass"] is mechanism_pass
+    assert finalization_events[-1] == expected_seal
+    assert finalization_events.index("plan.close") < finalization_events.index(
+        lifecycle.SMOKE_SUMMARY_FILENAME
+    )
+    assert (output / expected_seal).is_file()
     summary = json.loads((output / lifecycle.SMOKE_SUMMARY_FILENAME).read_text())
     assert summary["formal_training_authorized"] is False
     assert summary["internal_test"] == "sealed"
+    assert summary["result_seal"] == result["result_seal"]
