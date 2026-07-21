@@ -1468,14 +1468,10 @@ def evaluate_i3(
             f"I3 gradient record {index} has a negative norm",
         )
         _require(
-            scalars["per_aux_aggregate_discrepancy_norm"] >= 0.0
-            and scalars["per_aux_aggregate_rounding_bound_norm"] >= 0.0,
-            f"I3 gradient record {index} has a negative reconstruction norm",
-        )
-        _require(
-            scalars["per_aux_aggregate_discrepancy_norm"]
-            <= scalars["per_aux_aggregate_rounding_bound_norm"] + 1e-12,
-            f"I3 gradient record {index} per-aux aggregate reconstruction failed",
+            scalars["per_aux_aggregate_discrepancy_norm"] == 0.0
+            and scalars["per_aux_aggregate_rounding_bound_norm"] == 0.0,
+            f"I3 gradient record {index} joint per-aux aggregate reconstruction "
+            "must be exact",
         )
         cauchy_slack = 1e-8 * max(1.0, aux_norm * track_norm)
         _require(

@@ -1,9 +1,11 @@
 """Non-behavioral diagnostics frozen for the IBR1 authoritative smoke.
 
-Every observer in this module reads detached tensors only.  It does not add a
-backward pass, rewrite clipping, call ``optimizer.step`` itself, change
-``zero_grad``, or consume RNG.  Missing, duplicate, out-of-order, mixed-dtype,
-or nonfinite evidence fails closed before scientific gate adjudication.
+Observers may use ``torch.autograd.grad`` to inspect live losses against the
+dedicated probe, but they never accumulate parameter ``.grad`` or add a
+training ``backward`` pass.  They do not rewrite clipping, call
+``optimizer.step`` themselves, change ``zero_grad``, or consume RNG.  Missing,
+duplicate, out-of-order, mixed-dtype, or nonfinite evidence fails closed before
+scientific gate adjudication.
 """
 
 from __future__ import annotations
@@ -192,6 +194,7 @@ class GradientDiagnosticsCollector:
         *,
         g_track: torch.Tensor,
         g_aux: torch.Tensor,
+        g_aux_joint: torch.Tensor,
         per_aux: Mapping[str, torch.Tensor],
     ) -> None:
         if not isinstance(event, OptimizerUpdateEvent) or event.arm != S_CTRL:
@@ -202,8 +205,11 @@ class GradientDiagnosticsCollector:
             raise IBR1DiagnosticsContractError("gradient diagnostic clock discontinuity")
         track = _finite_vector(g_track, "g_track")
         aux = _finite_vector(g_aux, "g_aux")
-        if track.shape != aux.shape:
-            raise IBR1DiagnosticsContractError("g_track/g_aux vector shape drift")
+        joint_aux = _finite_vector(g_aux_joint, "g_aux_joint")
+        if track.shape != aux.shape or joint_aux.shape != aux.shape:
+            raise IBR1DiagnosticsContractError(
+                "g_track/g_aux/joint-aux vector shape drift"
+            )
         if set(per_aux) != set(IBR1_AUX_COMPONENTS):
             raise IBR1DiagnosticsContractError("per-aux contribution key drift")
         per_aux_vectors = {
@@ -212,22 +218,17 @@ class GradientDiagnosticsCollector:
         }
         if any(vector.shape != track.shape for vector in per_aux_vectors.values()):
             raise IBR1DiagnosticsContractError("per-aux contribution shape drift")
-        stacked_per_aux = torch.stack(tuple(per_aux_vectors.values()))
-        reconstructed_aux = stacked_per_aux.sum(dim=0)
-        aggregate_discrepancy = torch.abs(reconstructed_aux - aux)
-        # The live source gradients are FP32.  Aggregate aux uses one FP32
-        # backward over a sum, whereas the diagnostic blocks use three FP32
-        # backwards and are summed only after conversion to FP64.  Near
-        # cancellation therefore needs a rounding bound scaled by sum(abs),
-        # not a fixed tolerance relative to the near-zero aggregate.
-        fp32 = torch.finfo(torch.float32)
-        aggregate_rounding_bound = (
-            16.0 * fp32.eps * torch.sum(torch.abs(stacked_per_aux), dim=0)
-            + fp32.tiny
-        )
-        if bool(torch.any(aggregate_discrepancy > aggregate_rounding_bound).item()):
+        aggregate_discrepancy = torch.abs(joint_aux - aux)
+        # The production graph crosses a frozen BF16 LLM.  Three independent
+        # VJPs are useful descriptive geometry, but their FP64 sum is not a
+        # valid reconstruction of the one-pass aggregate VJP.  Integrity is
+        # instead proved by a second one-pass joint VJP over the exact ordered
+        # per-aux scalar tensors.  It must be exactly equal under
+        # ``torch.equal`` on the same device and dtype as the live aggregate
+        # VJP; no empirical rounding allowance is authoritative.
+        if not torch.equal(joint_aux, aux):
             raise IBR1DiagnosticsContractError(
-                "weighted per-aux vectors do not reconstruct aggregate g_aux"
+                "joint weighted per-aux VJP does not reconstruct aggregate g_aux"
             )
 
         track_norm = _vector_norm(track)
@@ -276,9 +277,7 @@ class GradientDiagnosticsCollector:
             "per_aux_aggregate_discrepancy_norm": _vector_norm(
                 aggregate_discrepancy
             ),
-            "per_aux_aggregate_rounding_bound_norm": _vector_norm(
-                aggregate_rounding_bound
-            ),
+            "per_aux_aggregate_rounding_bound_norm": 0.0,
         }
         self.gradient_records.append(record)
 
@@ -497,7 +496,171 @@ class IBR1G6Instrument(G6Instrument):
         super().__init__(
             probe, block_mode=block_mode, rows_per_update=rows_per_update
         )
+        probe_devices = {parameter.device for parameter in self.probe}
+        probe_dtypes = {parameter.dtype for parameter in self.probe}
+        if len(probe_devices) != 1 or probe_dtypes != {torch.float32}:
+            raise IBR1DiagnosticsContractError(
+                "joint G6 probe must use one device and float32 parameters"
+            )
+        self._probe_device = next(iter(probe_devices))
         self.collector = collector
+        self._sum_joint_aux: torch.Tensor | None = None
+        self._row_direct_aux: torch.Tensor | None = None
+
+    def _grad_vector(self, loss: Any, label: str) -> torch.Tensor:
+        if not isinstance(loss, torch.Tensor):
+            raise IBR1DiagnosticsContractError(f"{label} must be a torch.Tensor")
+        if loss.numel() != 1:
+            raise IBR1DiagnosticsContractError(f"{label} must be a scalar loss")
+        requires_probe_connection = label == "G6 aux_loss" or label.startswith(
+            "G6 per-aux "
+        )
+        if not loss.requires_grad:
+            if requires_probe_connection:
+                raise IBR1DiagnosticsContractError(
+                    f"{label} must remain connected to the G6 probe"
+                )
+            return self._zero_vector()
+        gradients = torch.autograd.grad(
+            loss,
+            self.probe,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        if requires_probe_connection and all(
+            gradient is None for gradient in gradients
+        ):
+            raise IBR1DiagnosticsContractError(
+                f"{label} must reach at least one G6 probe parameter"
+            )
+        pieces: list[torch.Tensor] = []
+        for parameter, gradient in zip(self.probe, gradients):
+            if gradient is None:
+                pieces.append(
+                    torch.zeros(parameter.numel(), dtype=torch.float64)
+                )
+            else:
+                pieces.append(
+                    gradient.detach().reshape(-1).to("cpu").to(torch.float64)
+                )
+        vector = torch.cat(pieces)
+        if not bool(torch.isfinite(vector).all().item()):
+            raise IBR1DiagnosticsContractError(f"{label} probe gradient is nonfinite")
+        if label == "G6 aux_loss":
+            if self._row_direct_aux is not None:
+                raise IBR1DiagnosticsContractError(
+                    "G6 direct aux gradient was captured more than once per row"
+                )
+            self._row_direct_aux = vector
+        return vector
+
+    def _joint_grad_vector(
+        self, losses: Sequence[torch.Tensor]
+    ) -> torch.Tensor:
+        active_losses = tuple(loss for loss in losses if loss.requires_grad)
+        if active_losses:
+            gradients = torch.autograd.grad(
+                active_losses,
+                self.probe,
+                grad_outputs=tuple(torch.ones_like(loss) for loss in active_losses),
+                retain_graph=True,
+                allow_unused=True,
+            )
+        else:
+            gradients = (None,) * len(self.probe)
+        pieces: list[torch.Tensor] = []
+        for parameter, gradient in zip(self.probe, gradients):
+            if gradient is None:
+                pieces.append(
+                    torch.zeros(parameter.numel(), dtype=torch.float64)
+                )
+            else:
+                pieces.append(
+                    gradient.detach().reshape(-1).to("cpu").to(torch.float64)
+                )
+        vector = torch.cat(pieces)
+        if not bool(torch.isfinite(vector).all().item()):
+            raise IBR1DiagnosticsContractError(
+                "G6 joint weighted per-aux probe gradient is nonfinite"
+            )
+        return vector
+
+    def observe_row(
+        self,
+        *,
+        aux_loss: torch.Tensor,
+        track1: torch.Tensor,
+        track2: torch.Tensor,
+        per_aux_losses: Mapping[str, torch.Tensor] | None = None,
+    ) -> None:
+        if self._row_direct_aux is not None:
+            raise IBR1DiagnosticsContractError(
+                "G6 direct aux gradient residue detected before row"
+            )
+        if not isinstance(per_aux_losses, Mapping) or set(per_aux_losses) != set(
+            IBR1_AUX_COMPONENTS
+        ):
+            raise IBR1DiagnosticsContractError(
+                "joint G6 diagnostics require the exact per-aux loss set"
+            )
+        if not isinstance(aux_loss, torch.Tensor) or aux_loss.numel() != 1:
+            raise IBR1DiagnosticsContractError("joint G6 aux loss must be scalar")
+        if aux_loss.device != self._probe_device or aux_loss.dtype != torch.float32:
+            raise IBR1DiagnosticsContractError(
+                "joint G6 aggregate aux loss must match the float32 probe device"
+            )
+        ordered_losses: list[torch.Tensor] = []
+        for name in IBR1_AUX_COMPONENTS:
+            loss = per_aux_losses[name]
+            if not isinstance(loss, torch.Tensor) or loss.numel() != 1:
+                raise IBR1DiagnosticsContractError(
+                    f"joint G6 per-aux loss {name} must be scalar"
+                )
+            if not loss.requires_grad:
+                raise IBR1DiagnosticsContractError(
+                    f"joint G6 per-aux loss {name} must remain graph-connected"
+                )
+            if loss.device != aux_loss.device or loss.dtype != aux_loss.dtype:
+                raise IBR1DiagnosticsContractError(
+                    "joint G6 per-aux loss device/dtype drift"
+                )
+            ordered_losses.append(loss)
+        joint_loss = ordered_losses[0]
+        for loss in ordered_losses[1:]:
+            joint_loss = joint_loss + loss
+        if not torch.equal(aux_loss.detach(), joint_loss.detach()):
+            raise IBR1DiagnosticsContractError(
+                "ordered per-aux scalars do not reconstruct aggregate aux loss"
+            )
+
+        # The name-to-loss meaning is frozen by the authority-bound
+        # ArmExecutor/adapter source.  This live check proves that the exact
+        # three named tensors are complete as an aggregate; it deliberately
+        # does not treat separately rounded VJPs as semantic identifiers.
+        super().observe_row(
+            aux_loss=aux_loss,
+            track1=track1,
+            track2=track2,
+            per_aux_losses=per_aux_losses,
+        )
+        if self._row_direct_aux is None:
+            raise IBR1DiagnosticsContractError(
+                "G6 direct aux gradient was not captured"
+            )
+        joint_vector = self._joint_grad_vector(ordered_losses)
+        if not torch.equal(self._row_direct_aux, joint_vector):
+            raise IBR1DiagnosticsContractError(
+                "joint weighted per-aux VJP does not reconstruct row aggregate g_aux"
+            )
+        if self._sum_joint_aux is None:
+            self._sum_joint_aux = self._zero_vector()
+        self._sum_joint_aux = self._sum_joint_aux + joint_vector
+        self._row_direct_aux = None
+
+    def _clear(self) -> None:
+        super()._clear()
+        self._sum_joint_aux = None
+        self._row_direct_aux = None
 
     def emit_update(self, event: OptimizerUpdateEvent):
         if event.grad_accum != self.rows_per_update:
@@ -508,15 +671,22 @@ class IBR1G6Instrument(G6Instrument):
             raise IBR1DiagnosticsContractError("G6 diagnostic accumulators are empty")
         if not self._per_aux_sums:
             raise IBR1DiagnosticsContractError("G6 per-aux diagnostics are empty")
+        if self._sum_joint_aux is None:
+            raise IBR1DiagnosticsContractError("G6 joint aux diagnostics are empty")
         divisor = float(event.grad_accum)
         g_aux = self._sum_aux.detach().clone() / divisor
+        g_aux_joint = self._sum_joint_aux.detach().clone() / divisor
         g_track = self._sum_track.detach().clone() / divisor
         per_aux = {
             name: vector.detach().clone() / divisor
             for name, vector in self._per_aux_sums.items()
         }
         self.collector.observe_contributions(
-            event, g_track=g_track, g_aux=g_aux, per_aux=per_aux
+            event,
+            g_track=g_track,
+            g_aux=g_aux,
+            g_aux_joint=g_aux_joint,
+            per_aux=per_aux,
         )
         return super().emit_update(event)
 

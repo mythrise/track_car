@@ -210,7 +210,7 @@ def test_g6_zero_track_uses_finite_sentinels_and_flags():
     assert all(value == 0.0 for value in record["per_aux_cosine_to_track"].values())
 
 
-def test_per_aux_reconstruction_allows_fp32_cancellation_but_rejects_omission():
+def test_joint_per_aux_reconstruction_ignores_independent_vjp_rounding_but_rejects_omission():
     event = _update_event(S_CTRL)
     per_aux = {
         "L_cot": torch.tensor([1.0], dtype=torch.float64),
@@ -229,16 +229,16 @@ def test_per_aux_reconstruction_allows_fp32_cancellation_but_rejects_omission():
         event,
         g_track=torch.zeros(1, dtype=torch.float64),
         g_aux=aggregate_fp32,
+        g_aux_joint=aggregate_fp32.clone(),
         per_aux=per_aux,
     )
     record = collector.gradient_records[0]
-    assert record["per_aux_aggregate_discrepancy_norm"] > 0.0
-    assert record["per_aux_aggregate_discrepancy_norm"] <= record[
-        "per_aux_aggregate_rounding_bound_norm"
-    ]
+    assert record["per_aux_aggregate_discrepancy_norm"] == 0.0
+    assert record["per_aux_aggregate_rounding_bound_norm"] == 0.0
 
     omitted = dict(per_aux)
     omitted["L_verify"] = torch.zeros(1, dtype=torch.float64)
+    omitted_joint = sum(omitted.values(), torch.zeros_like(aggregate_fp32))
     rejecting = GradientDiagnosticsCollector(
         expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
     )
@@ -247,7 +247,181 @@ def test_per_aux_reconstruction_allows_fp32_cancellation_but_rejects_omission():
             event,
             g_track=torch.zeros(1, dtype=torch.float64),
             g_aux=aggregate_fp32,
+            g_aux_joint=omitted_joint,
             per_aux=omitted,
+        )
+
+
+def test_g6_joint_vjp_is_exact_when_deep_independent_vjps_round():
+    torch.manual_seed(0)
+    probe = nn.Parameter(torch.randn(16, 16) * 0.02)
+    frozen_projection = torch.randn(16, 16) * 0.02
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=2, expected_optimizer_updates_per_arm=1
+    )
+    instrument = IBR1G6Instrument((probe,), collector)
+
+    for u_pre in range(2):
+        for _ in range(2):
+            inputs = torch.randn(2, 16)
+            hidden = torch.nn.functional.gelu(
+                torch.nn.functional.linear(inputs, probe)
+            )
+            shared = torch.nn.functional.gelu(
+                torch.nn.functional.linear(hidden, frozen_projection)
+            )
+            heads = tuple(
+                torch.randn(classes, 16) * 0.02 for classes in (17, 11, 5)
+            )
+            targets = torch.arange(2)
+            raw_losses = {
+                "L_cot": torch.nn.functional.cross_entropy(
+                    shared @ heads[0].T, targets % 17
+                ),
+                "L_future": torch.nn.functional.cross_entropy(
+                    shared @ heads[1].T, targets % 11
+                ),
+                "L_verify": ((shared @ heads[2].T) ** 2).mean(),
+            }
+            weighted = {
+                name: IBR1_FROZEN_AUX_COEFFICIENTS[name] * raw_losses[name]
+                for name in raw_losses
+            }
+            aggregate = sum(weighted.values(), shared.sum() * 0.0)
+            track = shared.square().mean()
+            instrument.observe_row(
+                aux_loss=aggregate,
+                track1=track,
+                track2=track,
+                per_aux_losses=weighted,
+            )
+
+        instrument.emit_update(_update_event(S_CTRL, u_pre))
+
+    assert len(collector.gradient_records) == 2
+    for record in collector.gradient_records:
+        assert record["per_aux_aggregate_discrepancy_norm"] == 0.0
+        assert record["per_aux_aggregate_rounding_bound_norm"] == 0.0
+
+
+def test_g6_joint_vjp_rejects_same_value_gradient_substitution():
+    weight = nn.Parameter(torch.tensor([1.0, 2.0]))
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    instrument = IBR1G6Instrument((weight,), collector)
+    components = {
+        name: (weight * torch.tensor([0.0, coefficient])).sum()
+        for name, coefficient in IBR1_FROZEN_AUX_COEFFICIENTS.items()
+    }
+    aggregate = sum(components.values())
+    tampered = dict(components)
+    tampered["L_verify"] = tampered["L_verify"].detach() + weight.sum() * 0.0
+    track = weight.sum() * 0.0
+
+    with pytest.raises(IBR1DiagnosticsContractError, match="row aggregate"):
+        instrument.observe_row(
+            aux_loss=aggregate,
+            track1=track,
+            track2=track,
+            per_aux_losses=tampered,
+        )
+
+
+def test_g6_joint_vjp_rejects_detached_graph_connected_zero():
+    weight = nn.Parameter(torch.tensor([1.0, 2.0]))
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    instrument = IBR1G6Instrument((weight,), collector)
+    components = {
+        name: (weight * torch.tensor([0.0, coefficient])).sum()
+        for name, coefficient in IBR1_FROZEN_AUX_COEFFICIENTS.items()
+    }
+    components["L_future"] = weight.sum() * 0.0
+    aggregate = sum(components.values())
+    tampered = dict(components)
+    tampered["L_future"] = tampered["L_future"].detach()
+    track = weight.sum() * 0.0
+
+    with pytest.raises(IBR1DiagnosticsContractError, match="graph-connected"):
+        instrument.observe_row(
+            aux_loss=aggregate,
+            track1=track,
+            track2=track,
+            per_aux_losses=tampered,
+        )
+
+
+def test_g6_joint_vjp_rejects_detached_leaf_with_requires_grad():
+    weight = nn.Parameter(torch.tensor([1.0, 2.0]))
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    instrument = IBR1G6Instrument((weight,), collector)
+    components = {
+        name: (weight * torch.tensor([0.0, coefficient])).sum()
+        for name, coefficient in IBR1_FROZEN_AUX_COEFFICIENTS.items()
+    }
+    components["L_future"] = weight.sum() * 0.0
+    aggregate = sum(components.values())
+    tampered = dict(components)
+    tampered["L_future"] = tampered["L_future"].detach().requires_grad_()
+    track = weight.sum() * 0.0
+
+    with pytest.raises(IBR1DiagnosticsContractError, match="reach at least one"):
+        instrument.observe_row(
+            aux_loss=aggregate,
+            track1=track,
+            track2=track,
+            per_aux_losses=tampered,
+        )
+
+
+def test_g6_joint_vjp_rejects_detached_aggregate_under_exact_cancellation():
+    weight = nn.Parameter(torch.tensor([1.0, 2.0]))
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    instrument = IBR1G6Instrument((weight,), collector)
+    positive = weight.sum()
+    components = {
+        "L_cot": positive,
+        "L_future": -positive,
+        "L_verify": weight.sum() * 0.0,
+    }
+    aggregate = sum(components.values())
+    detached_aggregate = aggregate.detach().requires_grad_()
+    track = weight.sum() * 0.0
+
+    with pytest.raises(IBR1DiagnosticsContractError, match="reach at least one"):
+        instrument.observe_row(
+            aux_loss=detached_aggregate,
+            track1=track,
+            track2=track,
+            per_aux_losses=components,
+        )
+
+
+def test_g6_joint_vjp_rejects_global_loss_dtype_drift():
+    weight = nn.Parameter(torch.tensor([1.0, 2.0]))
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    instrument = IBR1G6Instrument((weight,), collector)
+    components = {
+        name: (weight * torch.tensor([0.0, coefficient])).sum().double()
+        for name, coefficient in IBR1_FROZEN_AUX_COEFFICIENTS.items()
+    }
+    aggregate = sum(components.values())
+    track = weight.sum() * 0.0
+
+    with pytest.raises(IBR1DiagnosticsContractError, match="float32 probe device"):
+        instrument.observe_row(
+            aux_loss=aggregate,
+            track1=track,
+            track2=track,
+            per_aux_losses=components,
         )
 
 

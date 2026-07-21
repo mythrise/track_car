@@ -455,7 +455,7 @@ def _g6_and_gradient_geometry() -> tuple[list[dict[str, object]], dict[str, obje
                 },
                 "actual_ratio_denominator": 1.0,
                 "per_aux_aggregate_discrepancy_norm": 0.0,
-                "per_aux_aggregate_rounding_bound_norm": 1e-6,
+                "per_aux_aggregate_rounding_bound_norm": 0.0,
             }
         )
     return updates, {
@@ -475,6 +475,18 @@ def _g6_and_gradient_geometry() -> tuple[list[dict[str, object]], dict[str, obje
         ("updates", "signed_projection", 2.5, "signed projection"),
         ("geometry", "actual_ratio_denominator", 0.9, "ratio denominator"),
         ("geometry", "track_grad_norm", float("nan"), "finite canonical JSON"),
+        (
+            "geometry",
+            "per_aux_aggregate_discrepancy_norm",
+            1e-15,
+            "joint per-aux aggregate reconstruction must be exact",
+        ),
+        (
+            "geometry",
+            "per_aux_aggregate_rounding_bound_norm",
+            1e-15,
+            "joint per-aux aggregate reconstruction must be exact",
+        ),
     ],
 )
 def test_i3_cross_checks_projection_ratio_and_nonfinite(
