@@ -7,23 +7,28 @@ import math
 from pathlib import Path
 
 import pytest
+import torch
 
 from f2_experiment.assembly import EVAL_MODE_CONTRACT
 from f2_experiment.controller import DEFAULT_CONFIG
 from f2_experiment.model import ARCHITECTURE_LOCK as F2_ARCHITECTURE_LOCK
+from f2_experiment.runner import RunnerRow
 
+import ibr1_experiment.eval_guard as eval_guard_module
 from ibr1_experiment.assembly_model import (
     FAMILY_TO_ENGINE_ARM,
     IBR1_FROZEN_AUX_COEFFICIENTS,
 )
 from ibr1_experiment.authority import (
+    ASSEMBLY_PHASE_FINAL,
     ASSEMBLY_RECEIPT_CLASS,
     CAL_NUMERIC_EVIDENCE_CLASS,
+    SUPPORT_BINDING_CLASS,
     canonical_json_bytes,
     canonical_json_sha256,
 )
 from ibr1_experiment.diagnostics import GeometryCollector
-from ibr1_experiment.eval_guard import IBR1_EVAL_PHASES
+from ibr1_experiment.eval_guard import IBR1_EVAL_PHASES, IBR1EvalOrderGuard
 from ibr1_experiment.artifacts import (
     DIAGNOSTICS_MANIFEST_FILENAME,
     EXPECTED_OPTIMIZER_RECORDS,
@@ -34,6 +39,7 @@ from ibr1_experiment.gates import (
     IBR1_NEGATIVE_SEAL_CLASS,
     IBR1_PASS_SEAL_CLASS,
     IBR1GateContractError,
+    _g6_updates_from_gradient_geometry,
     build_ibr1_candidate_lock_receipt,
     build_ibr1_combined_gate_receipt,
     build_ibr1_negative_result_seal,
@@ -70,21 +76,76 @@ def _write(path: Path, document: dict[str, object]) -> Path:
     return path
 
 
-def _final_assembly() -> dict[str, object]:
+_EVAL_BLOCK_STARTS = (
+    540,
+    1699,
+    2377,
+    3418,
+    4066,
+    5042,
+    5614,
+    6650,
+    7184,
+    8315,
+    8873,
+    9900,
+    10882,
+    11801,
+    12482,
+    13582,
+)
+
+
+def _eval_ordered_indices() -> list[int]:
+    return [
+        original_index
+        for start in _EVAL_BLOCK_STARTS
+        for original_index in range(start, start + 32)
+    ]
+
+
+def _eval_support_binding() -> dict[str, object]:
+    indices = _eval_ordered_indices()
+    indices_sha = canonical_json_sha256(indices)
     return _self_hashed(
         {
             "schema_version": 1,
-            "analysis_class": ASSEMBLY_RECEIPT_CLASS,
+            "analysis_class": SUPPORT_BINDING_CLASS,
             "family_id": "IBR1",
-            "architecture_lock": IBR1_ARCHITECTURE_LOCK,
-            "phase": "final",
-            "candidate_cap": 1,
-            "lambda_freeze_binding": {"verified": True},
+            "observation": {
+                "supports": {
+                    "EVAL-FIX": {
+                        "rows": len(indices),
+                        "ordered_original_indices": indices,
+                        "ordered_original_indices_sha256": indices_sha,
+                        "row_set_sha256": indices_sha,
+                    }
+                },
+                "inherited_support_contract_payload_sha256": "f" * 64,
+            },
             "formal_training_authorized": False,
             "internal_test": "sealed",
             "internal_test_opened": False,
         }
     )
+
+
+def _final_assembly(*, with_eval_support: bool = False) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": 1,
+        "analysis_class": ASSEMBLY_RECEIPT_CLASS,
+        "family_id": "IBR1",
+        "architecture_lock": IBR1_ARCHITECTURE_LOCK,
+        "phase": "final",
+        "candidate_cap": 1,
+        "lambda_freeze_binding": {"verified": True},
+        "formal_training_authorized": False,
+        "internal_test": "sealed",
+        "internal_test_opened": False,
+    }
+    if with_eval_support:
+        payload["support_binding"] = _eval_support_binding()
+    return _self_hashed(payload)
 
 
 def _assembly_binding(
@@ -415,6 +476,10 @@ def _g6_and_gradient_geometry() -> tuple[list[dict[str, object]], dict[str, obje
             "u_pre": u_pre,
             "aux_reachable": True,
             "track_reachable": True,
+            "cosine_total_track": None,
+            "signed_projection": None,
+            "aux_track_ratio": None,
+            "per_aux_ratios": None,
         }
         if u_pre >= 8:
             update.update(
@@ -425,6 +490,15 @@ def _g6_and_gradient_geometry() -> tuple[list[dict[str, object]], dict[str, obje
                 }
             )
         updates.append(update)
+        exact_update = {
+            "u_pre": u_pre,
+            "aux_reachable": True,
+            "track_reachable": True,
+            "cosine_total_track": update.get("cosine_total_track"),
+            "signed_projection": update.get("signed_projection"),
+            "aux_track_ratio": update.get("aux_track_ratio"),
+            "per_aux_ratios": None,
+        }
         records.append(
             {
                 "u_pre": u_pre,
@@ -456,6 +530,7 @@ def _g6_and_gradient_geometry() -> tuple[list[dict[str, object]], dict[str, obje
                 "actual_ratio_denominator": 1.0,
                 "per_aux_aggregate_discrepancy_norm": 0.0,
                 "per_aux_aggregate_rounding_bound_norm": 0.0,
+                "exact_g6_update": exact_update,
             }
         )
     return updates, {
@@ -472,7 +547,7 @@ def _g6_and_gradient_geometry() -> tuple[list[dict[str, object]], dict[str, obje
 @pytest.mark.parametrize(
     ("target", "field", "value", "message"),
     [
-        ("updates", "signed_projection", 2.5, "signed projection"),
+        ("both", "signed_projection", 2.5, "signed projection"),
         ("geometry", "actual_ratio_denominator", 0.9, "ratio denominator"),
         ("geometry", "track_grad_norm", float("nan"), "finite canonical JSON"),
         (
@@ -498,12 +573,125 @@ def test_i3_cross_checks_projection_ratio_and_nonfinite(
     updates, geometry = _g6_and_gradient_geometry()
     assert evaluate_i3(updates, geometry).passed is True
 
-    if target == "updates":
+    if target == "both":
         updates[8][field] = value
+        geometry["records"][8]["exact_g6_update"][field] = value
     else:
         geometry["records"][8][field] = value
     with pytest.raises(IBR1GateContractError, match=message):
         evaluate_i3(updates, geometry)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("missing", "schema drifted"),
+        ("extra", "schema drifted"),
+        ("clock", "clock drifted"),
+        ("one_ulp", "differs from persisted exact diagnostics"),
+        ("signed_zero", "differs from persisted exact diagnostics"),
+        ("supplied_extra", "schema drifted"),
+        ("supplied_missing", "schema drifted"),
+    ],
+)
+def test_i3_exact_live_g6_mapping_fails_closed(
+    mutation: str,
+    message: str,
+) -> None:
+    updates, geometry = _g6_and_gradient_geometry()
+    exact = geometry["records"][8]["exact_g6_update"]
+    if mutation == "missing":
+        del geometry["records"][8]["exact_g6_update"]
+    elif mutation == "extra":
+        exact["unexpected"] = "not authoritative"
+    elif mutation == "clock":
+        exact["u_pre"] = 9
+    elif mutation == "one_ulp":
+        updates[8]["cosine_total_track"] = math.nextafter(1.0, 0.0)
+    elif mutation == "signed_zero":
+        updates[8]["signed_projection"] = 0.0
+        exact["signed_projection"] = -0.0
+    elif mutation == "supplied_missing":
+        del updates[8]["per_aux_ratios"]
+    else:
+        updates[8]["unexpected"] = "not authoritative"
+
+    with pytest.raises(IBR1GateContractError, match=message):
+        evaluate_i3(updates, geometry)
+
+
+def test_i3_replay_uses_exact_direct_dot_mapping_without_ulp_reconstruction():
+    updates, geometry = _g6_and_gradient_geometry()
+    sum_aux = torch.tensor([0.0, 1.0], dtype=torch.float64)
+    sum_track = torch.tensor([1.0, 1.0], dtype=torch.float64)
+    sum_total = sum_aux + sum_track
+    average_aux = sum_aux / 2.0
+    average_track = sum_track / 2.0
+    average_total = sum_total / 2.0
+
+    aux_norm = float(torch.linalg.vector_norm(average_aux).item())
+    track_norm = float(torch.linalg.vector_norm(average_track).item())
+    total_norm = float(torch.linalg.vector_norm(average_total).item())
+    aux_track_dot = float(torch.dot(average_aux, average_track).item())
+    direct_dot = float(torch.dot(sum_total, sum_track).item())
+    sum_track_norm = float(torch.linalg.vector_norm(sum_track).item())
+    sum_total_norm = float(torch.linalg.vector_norm(sum_total).item())
+    live_cosine = direct_dot / (sum_total_norm * sum_track_norm)
+    live_projection = direct_dot / sum_track_norm
+    old_reconstructed_dot = aux_track_dot + track_norm * track_norm
+    old_reconstructed_cosine = old_reconstructed_dot / (
+        total_norm * track_norm
+    )
+    old_reconstructed_projection = (
+        old_reconstructed_dot / track_norm
+    ) * 2.0
+
+    assert math.nextafter(live_cosine, math.inf) == old_reconstructed_cosine
+    assert math.nextafter(live_projection, math.inf) == (
+        old_reconstructed_projection
+    )
+
+    for u_pre, (update, record) in enumerate(
+        zip(updates, geometry["records"])
+    ):
+        record.update(
+            {
+                "track_grad_norm": track_norm,
+                "weighted_aux_grad_norm": aux_norm,
+                "total_grad_norm": total_norm,
+                "weighted_aux_track_dot": aux_track_dot,
+                "weighted_aux_track_cosine": aux_track_dot
+                / (aux_norm * track_norm),
+                "weighted_aux_signed_projection": aux_track_dot
+                / track_norm,
+                "actual_ratio_denominator": track_norm,
+            }
+        )
+        exact = record["exact_g6_update"]
+        if u_pre >= 8:
+            update.update(
+                {
+                    "cosine_total_track": live_cosine,
+                    "signed_projection": live_projection,
+                    "aux_track_ratio": aux_norm / track_norm,
+                }
+            )
+            exact.update(
+                {
+                    "cosine_total_track": live_cosine,
+                    "signed_projection": live_projection,
+                    "aux_track_ratio": aux_norm / track_norm,
+                }
+            )
+
+    production = evaluate_i3(updates, geometry).to_dict()
+    replay_updates = _g6_updates_from_gradient_geometry(geometry)
+    assert len(replay_updates) == 128
+    replay = evaluate_i3(replay_updates, geometry).to_dict()
+    assert replay == production
+    assert replay["receipt_payload_sha256"] == production[
+        "receipt_payload_sha256"
+    ]
 
 
 def _g7_updates() -> list[dict[str, object]]:
@@ -912,29 +1100,7 @@ def _eval_phase_receipt(phase_name: str, mode: str) -> dict[str, object]:
 
 
 def _eval_guard(binding: dict[str, object]) -> dict[str, object]:
-    block_starts = (
-        540,
-        1699,
-        2377,
-        3418,
-        4066,
-        5042,
-        5614,
-        6650,
-        7184,
-        8315,
-        8873,
-        9900,
-        10882,
-        11801,
-        12482,
-        13582,
-    )
-    indices = [
-        original_index
-        for start in block_starts
-        for original_index in range(start, start + 32)
-    ]
+    indices = _eval_ordered_indices()
     phases = [
         {
             **phase.to_dict(),
@@ -969,8 +1135,9 @@ def _seal_artifacts(
     root: Path,
     *,
     passed: bool,
+    with_eval_support: bool = False,
 ) -> dict[str, object]:
-    assembly = _final_assembly()
+    assembly = _final_assembly(with_eval_support=with_eval_support)
     assembly_path = _write(root / "final_assembly.json", assembly)
     binding = _assembly_binding(
         assembly,
@@ -1060,6 +1227,72 @@ def _seal_artifacts(
     }
 
 
+def _replace_synthetic_guard_with_real_finalized_receipt(
+    root: Path,
+    artifacts: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    final_path = Path(artifacts["final_assembly_receipt_path"])
+
+    def verify_final_assembly(
+        project_root: str | Path,
+        receipt_path: str | Path,
+        *,
+        required_phase: str | None = None,
+    ) -> dict[str, object]:
+        assert Path(project_root).resolve() == root.resolve()
+        assert Path(receipt_path).resolve() == final_path.resolve()
+        assert required_phase == ASSEMBLY_PHASE_FINAL
+        return json.loads(final_path.read_text(encoding="utf-8"))
+
+    monkeypatch.setattr(
+        eval_guard_module,
+        "verify_assembly_receipt",
+        verify_final_assembly,
+    )
+    rows = tuple(
+        RunnerRow(
+            original_row_index=index,
+            sequence_id=f"sequence-{index}",
+            frame_idx=index,
+            mirrored=False,
+            logged_prev_action=(0.0, 0.0, 0.0),
+            target_actions=torch.zeros(8, 3, dtype=torch.float32),
+            observation=object(),
+        )
+        for index in _eval_ordered_indices()
+    )
+    guard = IBR1EvalOrderGuard(
+        rows,
+        project_root=root,
+        final_assembly_receipt_path=final_path,
+    )
+
+    def predictor(row, prev_fy, *, mode, reset, position):
+        del row, prev_fy, mode, reset, position
+        return None
+
+    for phase in IBR1_EVAL_PHASES:
+        wrapped = guard.wrap_predictor(
+            predictor,
+            phase=phase.phase,
+            snapshot=phase.snapshot,
+            family_arm=phase.family_arm,
+            mode=phase.mode,
+        )
+        for position, row in enumerate(rows):
+            wrapped(
+                row,
+                None,
+                mode=phase.mode,
+                reset=position == 0,
+                position=position,
+            )
+    receipt = guard.finalize()
+    _write(Path(artifacts["eval_guard_receipt_path"]), receipt)
+    return receipt
+
+
 @pytest.mark.parametrize("passed", [True, False])
 def test_pass_and_negative_seals_bind_all_artifacts_and_verify(
     tmp_path: Path,
@@ -1076,6 +1309,68 @@ def test_pass_and_negative_seals_bind_all_artifacts_and_verify(
 
     seal_path = _write(tmp_path / "result_seal.json", document)
     assert verify_ibr1_result_seal(tmp_path, seal_path) == document
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_real_eval_guard_receipt_builds_freezes_and_verifies_result_seal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    passed: bool,
+) -> None:
+    artifacts = _seal_artifacts(
+        tmp_path,
+        passed=passed,
+        with_eval_support=True,
+    )
+    eval_guard = _replace_synthetic_guard_with_real_finalized_receipt(
+        tmp_path,
+        artifacts,
+        monkeypatch,
+    )
+    assert eval_guard["final_assembly_receipt"]["analysis_class"] == (
+        ASSEMBLY_RECEIPT_CLASS
+    )
+
+    builder = build_ibr1_pass_seal if passed else build_ibr1_negative_result_seal
+    built = builder(tmp_path, **artifacts)
+    expected_class = IBR1_PASS_SEAL_CLASS if passed else IBR1_NEGATIVE_SEAL_CLASS
+    assert built["analysis_class"] == expected_class
+
+    frozen = freeze_ibr1_result_seal(
+        tmp_path,
+        "real_guard_result_seal.json",
+        expected_pass=passed,
+        **artifacts,
+    )
+    assert frozen["mechanism_pass"] is passed
+    assert verify_ibr1_result_seal(tmp_path, frozen["path"]) == built
+
+
+@pytest.mark.parametrize("passed", [True, False])
+@pytest.mark.parametrize("mutation", ["missing", "wrong", "extra"])
+def test_result_seal_rejects_eval_guard_final_binding_schema_drift(
+    tmp_path: Path,
+    passed: bool,
+    mutation: str,
+) -> None:
+    artifacts = _seal_artifacts(tmp_path, passed=passed)
+    eval_guard_path = Path(artifacts["eval_guard_receipt_path"])
+    eval_guard = json.loads(eval_guard_path.read_text(encoding="utf-8"))
+    binding = eval_guard["final_assembly_receipt"]
+    if mutation == "missing":
+        del binding["analysis_class"]
+    elif mutation == "wrong":
+        binding["analysis_class"] = "wrong_final_assembly_class"
+    else:
+        binding["unexpected"] = "not_authoritative"
+    _write(eval_guard_path, eval_guard)
+
+    builder = build_ibr1_pass_seal if passed else build_ibr1_negative_result_seal
+    with pytest.raises(
+        IBR1GateContractError,
+        match="EVAL guard binds a different final assembly",
+    ):
+        builder(tmp_path, **artifacts)
 
 
 def test_seal_verification_detects_artifact_byte_drift(tmp_path: Path) -> None:
@@ -1197,6 +1492,12 @@ def test_seal_builder_rejects_checkpoint_and_diagnostics_bundle_pocs(
             "total_grad_norm": 1.4,
             "weighted_aux_track_dot": 0.4,
             "weighted_aux_signed_projection": 0.4,
+        }
+    )
+    gradient_document["records"][8]["exact_g6_update"].update(
+        {
+            "signed_projection": 2.8,
+            "aux_track_ratio": 0.4,
         }
     )
     _write(gradient_path, gradient_document)

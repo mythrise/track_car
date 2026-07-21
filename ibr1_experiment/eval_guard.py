@@ -23,6 +23,7 @@ from f2_experiment.support import SUPPORT_EXPECTATIONS, canonical_json_bytes
 from .assembly_model import IBR1_CTRL, IBR1_SELF, IBR1AssemblyContractError
 from .authority import (
     ASSEMBLY_PHASE_FINAL,
+    ASSEMBLY_RECEIPT_CLASS,
     SUPPORT_BINDING_CLASS,
     verify_assembly_receipt,
 )
@@ -182,7 +183,8 @@ class IBR1EvalOrderGuard:
             required_phase=ASSEMBLY_PHASE_FINAL,
         )
         _require(
-            final_assembly.get("phase") == ASSEMBLY_PHASE_FINAL
+            final_assembly.get("analysis_class") == ASSEMBLY_RECEIPT_CLASS
+            and final_assembly.get("phase") == ASSEMBLY_PHASE_FINAL
             and final_assembly.get("family_id") == IBR1_FAMILY_ID
             and final_assembly.get("formal_training_authorized") is False
             and final_assembly.get("internal_test") == "sealed"
@@ -293,6 +295,7 @@ class IBR1EvalOrderGuard:
             "path": relative_receipt_path,
             "sha256": final_assembly_file_sha,
             "receipt_payload_sha256": final_assembly_payload_sha,
+            "analysis_class": ASSEMBLY_RECEIPT_CLASS,
         }
         self._support_binding_payload_sha256 = support_payload_sha
         self._inherited_support_contract_payload_sha256 = _valid_sha256(

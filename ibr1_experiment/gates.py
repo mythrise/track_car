@@ -67,7 +67,15 @@ from .authority import (
     canonical_json_sha256,
 )
 from .checkpoint import CHECKPOINT_SIDECAR_CLASS
-from .diagnostics import DIAGNOSTIC_EPS, GeometryCollector
+from .diagnostics import (
+    DIAGNOSTIC_EPS,
+    EXACT_G6_UPDATE_FIELD,
+    EXACT_G6_UPDATE_KEYS,
+    GeometryCollector,
+    IBR1DiagnosticsContractError,
+    exact_g6_update_mapping,
+    validate_exact_g6_update_mapping,
+)
 from .eval_guard import (
     EVAL_GUARD_RECEIPT_CLASS,
     FROZEN_EVAL_ORDERED_ORIGINAL_INDICES_SHA256,
@@ -778,8 +786,10 @@ def _coerce_g6(value: Any, index: int) -> G6Update:
     if isinstance(value, G6Update):
         return value
     _require(isinstance(value, Mapping), f"G6 update {index} must be a mapping")
-    required = ("u_pre", "aux_reachable", "track_reachable")
-    _require(all(name in value for name in required), f"G6 update {index} is incomplete")
+    _require(
+        set(value) == set(EXACT_G6_UPDATE_KEYS),
+        f"G6 update {index} schema drifted",
+    )
     return G6Update(
         u_pre=value["u_pre"],
         aux_reachable=value["aux_reachable"],
@@ -789,6 +799,36 @@ def _coerce_g6(value: Any, index: int) -> G6Update:
         aux_track_ratio=value.get("aux_track_ratio"),
         per_aux_ratios=value.get("per_aux_ratios"),
     )
+
+
+def _exact_g6_mapping_from_update(
+    update: G6Update,
+    index: int,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    try:
+        return exact_g6_update_mapping(update, f"{label} {index}")
+    except IBR1DiagnosticsContractError as exc:
+        raise IBR1GateContractError(str(exc)) from exc
+
+
+def _exact_g6_mapping_from_record(
+    value: Any,
+    index: int,
+) -> dict[str, Any]:
+    try:
+        mapping = validate_exact_g6_update_mapping(
+            value,
+            f"I3 gradient record {index} exact G6 update",
+        )
+    except IBR1DiagnosticsContractError as exc:
+        raise IBR1GateContractError(str(exc)) from exc
+    _require(
+        mapping["u_pre"] == index,
+        f"I3 gradient record {index} exact G6 update clock drifted",
+    )
+    return mapping
 
 
 def _coerce_g7(value: Any, index: int) -> G7Update:
@@ -1454,6 +1494,26 @@ def evaluate_i3(
         _require(update.u_pre == index, f"I3 G6 update {index} clock drifted")
         _require(isinstance(update.aux_reachable, bool), f"I3 G6[{index}] aux_reachable must be boolean")
         _require(isinstance(update.track_reachable, bool), f"I3 G6[{index}] track_reachable must be boolean")
+        exact_update = _exact_g6_mapping_from_record(
+            record.get(EXACT_G6_UPDATE_FIELD),
+            index,
+        )
+        supplied_update = _exact_g6_mapping_from_update(
+            update,
+            index,
+            label="I3 supplied live G6 update",
+        )
+        _require(
+            _canonical(
+                supplied_update,
+                f"I3 supplied live G6 update {index}",
+            )
+            == _canonical(
+                exact_update,
+                f"I3 persisted exact G6 update {index}",
+            ),
+            f"I3 G6 update {index} differs from persisted exact diagnostics",
+        )
 
         scalars = {
             name: _finite_float(record.get(name), f"I3[{index}].{name}")
@@ -2427,44 +2487,12 @@ def _g6_updates_from_gradient_geometry(
     updates: list[dict[str, Any]] = []
     for index, value in enumerate(records):
         record = _mapping(value, f"diagnostics gradient record {index}")
-        track_norm = _finite_float(
-            record.get("track_grad_norm"),
-            f"diagnostics gradient record {index} track norm",
-        )
-        aux_norm = _finite_float(
-            record.get("weighted_aux_grad_norm"),
-            f"diagnostics gradient record {index} weighted auxiliary norm",
-        )
-        total_norm = _finite_float(
-            record.get("total_grad_norm"),
-            f"diagnostics gradient record {index} total norm",
-        )
-        aux_track_dot = _finite_float(
-            record.get("weighted_aux_track_dot"),
-            f"diagnostics gradient record {index} auxiliary/track dot",
-        )
-        update: dict[str, Any] = {
-            "u_pre": index,
-            "aux_reachable": aux_norm > 0.0,
-            "track_reachable": track_norm > 0.0,
-        }
-        if index >= 8:
-            denominator = max(track_norm, DIAGNOSTIC_EPS)
-            total_track_dot = aux_track_dot + track_norm * track_norm
-            cosine = total_track_dot / (
-                max(total_norm, DIAGNOSTIC_EPS) * max(track_norm, DIAGNOSTIC_EPS)
+        updates.append(
+            _exact_g6_mapping_from_record(
+                record.get(EXACT_G6_UPDATE_FIELD),
+                index,
             )
-            update.update(
-                {
-                    "cosine_total_track": max(-1.0, min(1.0, cosine)),
-                    "signed_projection": (
-                        total_track_dot / denominator
-                    )
-                    * I3_GRAD_ACCUM,
-                    "aux_track_ratio": aux_norm / denominator,
-                }
-            )
-        updates.append(update)
+        )
     return tuple(updates)
 
 

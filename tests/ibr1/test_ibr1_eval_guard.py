@@ -219,6 +219,7 @@ def test_final_assembly_binds_fixed_512_row_order_only_receipt(
         "receipt_payload_sha256": final_authority["document"][
             "receipt_payload_sha256"
         ],
+        "analysis_class": ASSEMBLY_RECEIPT_CLASS,
     }
     support = final_authority["document"]["support_binding"]
     assert receipt["fresh_support_binding"]["receipt_payload_sha256"] == (
@@ -428,6 +429,15 @@ def test_support_sha_drift_inside_verified_assembly_is_rejected(
     document["support_binding"] = _rehash(support_binding)
     document = _rehash(document)
     _write_receipt(final_authority["path"], document)
+
+    with pytest.raises(IBR1EvalGuardContractError, match="identity drifted"):
+        _guard(rows, final_authority)
+
+
+def test_final_assembly_analysis_class_drift_is_rejected(rows, final_authority):
+    document = dict(final_authority["document"])
+    document["analysis_class"] = "wrong_final_assembly_class"
+    _write_receipt(final_authority["path"], _rehash(document))
 
     with pytest.raises(IBR1EvalGuardContractError, match="identity drifted"):
         _guard(rows, final_authority)

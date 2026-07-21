@@ -20,6 +20,7 @@ from torch import nn
 
 from f2_experiment.assembly_data import F2AssemblyContractError
 from f2_experiment.assembly_model import F2ArmModules, G6Instrument
+from f2_experiment.evaluation import G6Update
 from f2_experiment.runner import (
     GRAD_ACCUM,
     S_CTRL,
@@ -50,6 +51,16 @@ EVAL_SNAPSHOTS = (
     "update128_IBR1-CTRL",
     "update128_IBR1-SELF",
 )
+EXACT_G6_UPDATE_FIELD = "exact_g6_update"
+EXACT_G6_UPDATE_KEYS = (
+    "u_pre",
+    "aux_reachable",
+    "track_reachable",
+    "cosine_total_track",
+    "signed_projection",
+    "aux_track_ratio",
+    "per_aux_ratios",
+)
 
 
 class IBR1DiagnosticsContractError(F2AssemblyContractError):
@@ -63,6 +74,116 @@ def _finite_float(value: Any, label: str) -> float:
     if not math.isfinite(numeric):
         raise IBR1DiagnosticsContractError(f"{label} is nonfinite")
     return numeric
+
+
+def exact_g6_update_mapping(update: G6Update, label: str) -> dict[str, Any]:
+    if not isinstance(update, G6Update):
+        raise IBR1DiagnosticsContractError(f"{label} must be a G6Update")
+    if isinstance(update.u_pre, bool) or not isinstance(update.u_pre, int):
+        raise IBR1DiagnosticsContractError(f"{label}.u_pre must be an integer")
+    if update.u_pre < 0:
+        raise IBR1DiagnosticsContractError(f"{label}.u_pre must be nonnegative")
+    if not isinstance(update.aux_reachable, bool):
+        raise IBR1DiagnosticsContractError(
+            f"{label}.aux_reachable must be boolean"
+        )
+    if not isinstance(update.track_reachable, bool):
+        raise IBR1DiagnosticsContractError(
+            f"{label}.track_reachable must be boolean"
+        )
+
+    optional_scalars: dict[str, float | None] = {}
+    for name in (
+        "cosine_total_track",
+        "signed_projection",
+        "aux_track_ratio",
+    ):
+        value = getattr(update, name)
+        if value is None:
+            optional_scalars[name] = None
+            continue
+        if not isinstance(value, float):
+            raise IBR1DiagnosticsContractError(
+                f"{label}.{name} must be a binary64 float or null"
+            )
+        optional_scalars[name] = _finite_float(value, f"{label}.{name}")
+    cosine = optional_scalars["cosine_total_track"]
+    if cosine is not None and not -1.0 <= cosine <= 1.0:
+        raise IBR1DiagnosticsContractError(
+            f"{label}.cosine_total_track must be in [-1, 1]"
+        )
+    ratio = optional_scalars["aux_track_ratio"]
+    if ratio is not None and ratio < 0.0:
+        raise IBR1DiagnosticsContractError(
+            f"{label}.aux_track_ratio must be nonnegative"
+        )
+
+    per_aux_ratios: dict[str, float] | None = None
+    if update.per_aux_ratios is not None:
+        if not isinstance(update.per_aux_ratios, Mapping) or set(
+            update.per_aux_ratios
+        ) != set(IBR1_AUX_COMPONENTS):
+            raise IBR1DiagnosticsContractError(
+                f"{label}.per_aux_ratios auxiliary names drifted"
+            )
+        per_aux_ratios = {}
+        for name in IBR1_AUX_COMPONENTS:
+            value = update.per_aux_ratios[name]
+            if not isinstance(value, float):
+                raise IBR1DiagnosticsContractError(
+                    f"{label}.per_aux_ratios.{name} must be a binary64 float"
+                )
+            numeric = _finite_float(value, f"{label}.per_aux_ratios.{name}")
+            if numeric < 0.0:
+                raise IBR1DiagnosticsContractError(
+                    f"{label}.per_aux_ratios.{name} must be nonnegative"
+                )
+            per_aux_ratios[name] = numeric
+
+    if update.u_pre < 8:
+        if any(value is not None for value in optional_scalars.values()) or (
+            per_aux_ratios is not None
+        ):
+            raise IBR1DiagnosticsContractError(
+                f"{label} emits forbidden pre-window geometry"
+            )
+    elif (
+        optional_scalars["cosine_total_track"] is None
+        or optional_scalars["signed_projection"] is None
+        or optional_scalars["aux_track_ratio"] is None
+        or per_aux_ratios is not None
+    ):
+        raise IBR1DiagnosticsContractError(
+            f"{label} must contain complete B* gradient-window geometry"
+        )
+
+    return {
+        "u_pre": update.u_pre,
+        "aux_reachable": update.aux_reachable,
+        "track_reachable": update.track_reachable,
+        **optional_scalars,
+        "per_aux_ratios": per_aux_ratios,
+    }
+
+
+def validate_exact_g6_update_mapping(
+    value: Any,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != set(EXACT_G6_UPDATE_KEYS):
+        raise IBR1DiagnosticsContractError(f"{label} schema drifted")
+    return exact_g6_update_mapping(
+        G6Update(
+            u_pre=value["u_pre"],
+            aux_reachable=value["aux_reachable"],
+            track_reachable=value["track_reachable"],
+            cosine_total_track=value["cosine_total_track"],
+            signed_projection=value["signed_projection"],
+            aux_track_ratio=value["aux_track_ratio"],
+            per_aux_ratios=value["per_aux_ratios"],
+        ),
+        label,
+    )
 
 
 def _finite_vector(value: torch.Tensor, label: str) -> torch.Tensor:
@@ -281,6 +402,38 @@ class GradientDiagnosticsCollector:
         }
         self.gradient_records.append(record)
 
+    def attach_exact_g6_update(
+        self,
+        event: OptimizerUpdateEvent,
+        update: G6Update,
+    ) -> None:
+        if not isinstance(event, OptimizerUpdateEvent) or event.arm != S_CTRL:
+            raise IBR1DiagnosticsContractError(
+                "exact G6 update attachment is S-CTRL only"
+            )
+        if len(self.gradient_records) != event.u_pre + 1:
+            raise IBR1DiagnosticsContractError(
+                "exact G6 update attachment clock is not the latest gradient record"
+            )
+        record = self.gradient_records[event.u_pre]
+        if record.get("u_pre") != event.u_pre:
+            raise IBR1DiagnosticsContractError(
+                "exact G6 update attachment record clock drifted"
+            )
+        if EXACT_G6_UPDATE_FIELD in record:
+            raise IBR1DiagnosticsContractError(
+                "exact G6 update was attached more than once"
+            )
+        mapping = exact_g6_update_mapping(
+            update,
+            f"exact G6 update {event.u_pre}",
+        )
+        if mapping["u_pre"] != event.u_pre:
+            raise IBR1DiagnosticsContractError(
+                "exact G6 update attachment clock differs from the live event"
+            )
+        record[EXACT_G6_UPDATE_FIELD] = mapping
+
     def begin_optimizer_update(
         self,
         event: OptimizerUpdateEvent,
@@ -436,6 +589,19 @@ class GradientDiagnosticsCollector:
             raise IBR1DiagnosticsContractError(
                 "gradient geometry cardinality mismatch"
             )
+        for index, record in enumerate(self.gradient_records):
+            if record.get("u_pre") != index:
+                raise IBR1DiagnosticsContractError(
+                    "gradient geometry clock mismatch"
+                )
+            exact_update = validate_exact_g6_update_mapping(
+                record.get(EXACT_G6_UPDATE_FIELD),
+                f"gradient record {index} exact G6 update",
+            )
+            if exact_update["u_pre"] != index:
+                raise IBR1DiagnosticsContractError(
+                    "gradient record exact G6 update clock mismatch"
+                )
         expected_optimizer = 2 * self.expected_optimizer_updates_per_arm
         if len(self.optimizer_records) != expected_optimizer:
             raise IBR1DiagnosticsContractError(
@@ -688,7 +854,9 @@ class IBR1G6Instrument(G6Instrument):
             g_aux_joint=g_aux_joint,
             per_aux=per_aux,
         )
-        return super().emit_update(event)
+        update = super().emit_update(event)
+        self.collector.attach_exact_g6_update(event, update)
+        return update
 
 
 class OptimizerDiagnosticsHandle:

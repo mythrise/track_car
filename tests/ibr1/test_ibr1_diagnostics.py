@@ -166,6 +166,15 @@ def test_g6_absolute_geometry_uses_two_row_mean_and_preserves_gate_update():
     assert gate_update.aux_reachable
     assert gate_update.track_reachable
     record = collector.gradient_records[0]
+    assert record["exact_g6_update"] == {
+        "u_pre": 0,
+        "aux_reachable": True,
+        "track_reachable": True,
+        "cosine_total_track": None,
+        "signed_projection": None,
+        "aux_track_ratio": None,
+        "per_aux_ratios": None,
+    }
     assert record["track_grad_norm"] == pytest.approx(2.0)
     assert record["weighted_aux_grad_norm"] == pytest.approx(0.8595)
     assert record["total_grad_norm"] == pytest.approx(
@@ -181,6 +190,125 @@ def test_g6_absolute_geometry_uses_two_row_mean_and_preserves_gate_update():
         assert record[
             "per_aux_raw_grad_norm_derived_from_frozen_lambda"
         ][name] == pytest.approx(1.0)
+
+
+def test_exact_g6_update_attachment_is_once_only_and_clock_bound():
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    gate_update = _run_g6_update(collector)
+
+    with pytest.raises(IBR1DiagnosticsContractError, match="more than once"):
+        collector.attach_exact_g6_update(_update_event(S_CTRL), gate_update)
+
+    del collector.gradient_records[0]["exact_g6_update"]
+    with pytest.raises(IBR1DiagnosticsContractError, match="live event"):
+        collector.attach_exact_g6_update(
+            _update_event(S_CTRL),
+            replace(gate_update, u_pre=1),
+        )
+
+
+def test_gradient_finalize_rejects_missing_exact_g6_update():
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    event = _update_event(S_CTRL)
+    per_aux = {
+        name: torch.tensor([coefficient], dtype=torch.float64)
+        for name, coefficient in IBR1_FROZEN_AUX_COEFFICIENTS.items()
+    }
+    aggregate = sum(per_aux.values(), torch.zeros(1, dtype=torch.float64))
+    collector.observe_contributions(
+        event,
+        g_track=torch.ones(1, dtype=torch.float64),
+        g_aux=aggregate,
+        g_aux_joint=aggregate.clone(),
+        per_aux=per_aux,
+    )
+
+    with pytest.raises(IBR1DiagnosticsContractError, match="schema drifted"):
+        collector.finalize()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("extra", "schema drifted"),
+        ("clock", "clock mismatch"),
+        ("type", "must be boolean"),
+        ("warmup", "forbidden pre-window geometry"),
+    ],
+)
+def test_gradient_finalize_rejects_exact_g6_mapping_drift(
+    mutation: str,
+    message: str,
+) -> None:
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=1, expected_optimizer_updates_per_arm=1
+    )
+    _run_g6_update(collector)
+    exact = collector.gradient_records[0]["exact_g6_update"]
+    if mutation == "extra":
+        exact["unexpected"] = "not authoritative"
+    elif mutation == "clock":
+        exact["u_pre"] = 1
+    elif mutation == "type":
+        exact["aux_reachable"] = 1
+    else:
+        exact["cosine_total_track"] = 0.0
+
+    with pytest.raises(IBR1DiagnosticsContractError, match=message):
+        collector.finalize()
+
+
+def test_exact_live_g6_mapping_is_attached_for_all_128_updates():
+    collector = GradientDiagnosticsCollector(
+        expected_gradient_updates=128, expected_optimizer_updates_per_arm=1
+    )
+    weight = nn.Parameter(torch.tensor([1.0, 2.0]))
+    instrument = IBR1G6Instrument((weight,), collector)
+    updates = []
+    for u_pre in range(128):
+        for _ in range(2):
+            track = (weight * torch.tensor([0.5, 0.5])).sum()
+            graph_zero = weight.sum() * 0.0
+            components = {
+                "L_cot": (weight * torch.tensor([0.0, 0.5])).sum(),
+                "L_future": graph_zero,
+                "L_verify": graph_zero,
+            }
+            instrument.observe_row(
+                aux_loss=sum(components.values()),
+                track1=track,
+                track2=track,
+                per_aux_losses=components,
+            )
+        updates.append(instrument.emit_update(_update_event(S_CTRL, u_pre)))
+
+    assert len(collector.gradient_records) == 128
+    for u_pre, (update, record) in enumerate(
+        zip(updates, collector.gradient_records)
+    ):
+        exact = record["exact_g6_update"]
+        assert exact["u_pre"] == u_pre == update.u_pre
+        assert exact["aux_reachable"] is update.aux_reachable
+        assert exact["track_reachable"] is update.track_reachable
+        if u_pre < 8:
+            assert all(
+                exact[name] is None
+                for name in (
+                    "cosine_total_track",
+                    "signed_projection",
+                    "aux_track_ratio",
+                    "per_aux_ratios",
+                )
+            )
+        else:
+            assert exact["cosine_total_track"] == update.cosine_total_track
+            assert exact["signed_projection"] == update.signed_projection
+            assert exact["aux_track_ratio"] == update.aux_track_ratio
+            assert exact["per_aux_ratios"] is None
 
 
 def test_g6_zero_track_uses_finite_sentinels_and_flags():
