@@ -334,6 +334,73 @@ def _rewrite_payload_and_sidecar(
     return file_sha, _file_sha256(sidecar_path)
 
 
+def test_checkpoint_tensor_sha_reuses_f2_full_state_domain() -> None:
+    adapter_state = {
+        "weight": torch.tensor([[1.0, -2.0]], dtype=torch.float32),
+        "counter": torch.tensor([3], dtype=torch.int64),
+    }
+    model_state = {
+        "bias": torch.tensor([0.25, -0.5], dtype=torch.float64),
+    }
+    expected = checkpoint_init_sha256(
+        {
+            **{f"adapter.{name}": tensor for name, tensor in adapter_state.items()},
+            **{f"model.{name}": tensor for name, tensor in model_state.items()},
+        }
+    )
+    observed = checkpoint_tensor_sha256(
+        adapter_state=adapter_state,
+        model_state=model_state,
+    )
+    assert observed == expected
+
+    drifted_model = {name: tensor.clone() for name, tensor in model_state.items()}
+    drifted_model["bias"][0] += 1.0
+    assert checkpoint_tensor_sha256(
+        adapter_state=adapter_state,
+        model_state=drifted_model,
+    ) != expected
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_checkpoint_tensor_sha_is_cpu_cuda_invariant() -> None:
+    adapter_cpu = {"weight": torch.arange(6, dtype=torch.float32).reshape(2, 3)}
+    model_cpu = {"scale": torch.tensor(0.5, dtype=torch.float32)}
+    expected = checkpoint_tensor_sha256(
+        adapter_state=adapter_cpu,
+        model_state=model_cpu,
+    )
+    assert checkpoint_tensor_sha256(
+        adapter_state={name: tensor.cuda() for name, tensor in adapter_cpu.items()},
+        model_state={name: tensor.cuda() for name, tensor in model_cpu.items()},
+    ) == expected
+
+
+def test_update0_saved_tensor_hash_matches_sealed_init_domain(tmp_path: Path) -> None:
+    paired = _paired()
+    ctrl = _save(
+        tmp_path / "ctrl",
+        paired=paired,
+        arm=paired.arms[S_CTRL],
+        engine_arm=S_CTRL,
+        u_pre=0,
+    )
+    self_arm = _save(
+        tmp_path / "self",
+        paired=paired,
+        arm=paired.arms[S_SELF],
+        engine_arm=S_SELF,
+        u_pre=0,
+    )
+    assert {
+        ctrl.info["tensor_sha256"],
+        self_arm.info["tensor_sha256"],
+    } == {paired.checkpoint_init_sha256}
+
+    payload = torch.load(ctrl.path, map_location="cpu", weights_only=True)
+    assert payload["checkpoint_tensor_sha256"] == paired.checkpoint_init_sha256
+
+
 def test_loader_returns_cpu_eval_snapshot_without_mutating_live_state(tmp_path):
     saved = _save(tmp_path)
     saved_adapter = _clone_state(saved.arm.modules.adapter)

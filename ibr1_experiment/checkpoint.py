@@ -649,9 +649,17 @@ def checkpoint_tensor_sha256(
     adapter_state: Mapping[str, torch.Tensor],
     model_state: Mapping[str, torch.Tensor],
 ) -> str:
-    """Hash the two logical state sections without torch serialization."""
+    """Hash checkpoint tensors in the inherited F2 full-state domain.
 
-    digest = hashlib.sha256(b"ibr1-checkpoint-tensors-v1\0")
+    IBR1 persists adapter/model state in two payload sections, while the
+    sealed comparator and paired runner hash one flat state whose names are
+    prefixed with ``adapter.`` and ``model.``.  Normalize the sections back to
+    that frozen naming contract before hashing so update-0 sidecars, the
+    sealed initialization, lifecycle checks, and count/gate receipts all bind
+    the same tensor identity.
+    """
+
+    full_state: dict[str, torch.Tensor] = {}
     for section, state in (
         ("adapter", adapter_state),
         ("model", model_state),
@@ -662,24 +670,13 @@ def checkpoint_tensor_sha256(
         )
         for name in _sorted_state_names(state, section):
             tensor = _validate_tensor(name, state[name], section)
-            contiguous = tensor.detach().cpu().contiguous().reshape(-1)
-            raw = contiguous.view(torch.uint8).numpy().tobytes()
-            metadata = json.dumps(
-                {
-                    "section": section,
-                    "name": name,
-                    "dtype": str(tensor.dtype),
-                    "shape": list(tensor.shape),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("utf-8")
-            digest.update(len(metadata).to_bytes(8, "big"))
-            digest.update(metadata)
-            digest.update(len(raw).to_bytes(8, "big"))
-            digest.update(raw)
-    return digest.hexdigest()
+            qualified_name = f"{section}.{name}"
+            _require(
+                qualified_name not in full_state,
+                f"checkpoint full-state key collision: {qualified_name!r}",
+            )
+            full_state[qualified_name] = tensor
+    return checkpoint_init_sha256(full_state)
 
 
 def _source_binding(project_root: Path) -> dict[str, str]:
