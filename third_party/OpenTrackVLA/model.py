@@ -16,7 +16,15 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 from transformers import AutoTokenizer, AutoModel
-from cache_gridpool import VisionFeatureCacher, VisionCacheConfig, grid_pool_tokens, adapt_siglip_grid
+from cache_gridpool import (
+    VisionFeatureCacher,
+    VisionCacheConfig,
+    adapt_siglip_grid,
+    atomic_torch_save,
+    grid_pool_tokens,
+    legacy_token_cache_filename,
+    token_cache_filename,
+)
 from local_weights import default_qwen_candidates, resolve_local_model_path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +59,25 @@ def load_tokens_file(path: str) -> torch.Tensor:
                     t = t[0]
                 return t.float()
     raise ValueError(f"Unrecognized token file: {path}")
+
+
+def token_cache_candidates(token_dir: Path, image_path: Path, level: str) -> List[Path]:
+    """Prefer collision-safe v2 names, then fall back to legacy stem names."""
+
+    current = token_dir / token_cache_filename(image_path, level)
+    legacy = token_dir / legacy_token_cache_filename(image_path, level)
+    return [current] if current == legacy else [current, legacy]
+
+
+def load_first_cached_token(paths: List[Path]) -> torch.Tensor:
+    last_error = None
+    for path in paths:
+        try:
+            return load_tokens_file(str(path))
+        except Exception as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
 
 
 def integrate_actions_to_waypoints(actions: np.ndarray, n_waypoints: int, dt: float = 0.2) -> np.ndarray:
@@ -181,11 +208,44 @@ class TVIEmbedder(nn.Module):
         return emb.squeeze(0)
 
 
+class MPSStableLayerNorm(nn.LayerNorm):
+    """LayerNorm with an explicit float32 MPS path.
+
+    PyTorch 2.11 on the current Apple-MPS stack can emit corrupt affine
+    parameter gradients for ``nn.LayerNorm`` when its inputs do not require
+    gradients.  The observed values were exact billion-scale sentinels while
+    the analytical weight/bias gradients stayed below 0.1.  Expressing the
+    normalization with ordinary reductions and elementwise operations avoids
+    that backend kernel while preserving the standard state-dict contract.
+    """
+
+    def _manual_forward(self, value: torch.Tensor) -> torch.Tensor:
+        original_dtype = value.dtype
+        value32 = value.float()
+        normalized_dims = tuple(
+            range(value32.dim() - len(self.normalized_shape), value32.dim())
+        )
+        mean = value32.mean(dim=normalized_dims, keepdim=True)
+        centered = value32 - mean
+        variance = centered.square().mean(dim=normalized_dims, keepdim=True)
+        output = centered * torch.rsqrt(variance + self.eps)
+        if self.elementwise_affine:
+            output = output * self.weight.float()
+            if self.bias is not None:
+                output = output + self.bias.float()
+        return output.to(original_dtype)
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if value.device.type == "mps":
+            return self._manual_forward(value)
+        return super().forward(value)
+
+
 class CrossModalityProjector(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
+            MPSStableLayerNorm(in_dim),
             nn.Linear(in_dim, out_dim), nn.GELU(),
             nn.Linear(out_dim, out_dim)
         )
@@ -355,6 +415,7 @@ class DataConfig:
     default_dt: float = 0.1
     cache_root: Optional[str] = None
     use_bbox_token: bool = False
+    require_cached_tokens: bool = False
 
 
 class JsonTrackingDataset(Dataset):
@@ -508,15 +569,20 @@ class JsonTrackingDataset(Dataset):
         except ValueError:
             rel_curr = abs_curr_img
         curr_token_dir = self.cache_root / rel_curr.parent
-        curr_token_name = rel_curr.stem + "_vfine.pt"
-        curr_tok_path = curr_token_dir / curr_token_name
+        curr_tok_path = token_cache_candidates(curr_token_dir, rel_curr, "fine")[0]
         try:
-            fine_tokens = self._load_tokens(str(curr_tok_path))
+            fine_tokens = load_first_cached_token(
+                token_cache_candidates(curr_token_dir, rel_curr, "fine")
+            )
         except Exception:
+            if self.cfg.require_cached_tokens:
+                raise RuntimeError(
+                    f"required fine vision token is missing or invalid: {curr_tok_path}"
+                )
             curr_token_dir.mkdir(parents=True, exist_ok=True)
             vc, vf = self._encode_image_tokens(abs_curr_img)
             try:
-                torch.save(vf.half(), str(curr_tok_path))
+                atomic_torch_save(vf.half(), curr_tok_path)
             except Exception:
                 pass
             fine_tokens = vf
@@ -540,15 +606,20 @@ class JsonTrackingDataset(Dataset):
                 except ValueError:
                     rel_img = abs_img
                 token_dir = self.cache_root / rel_img.parent
-                token_name = rel_img.stem + "_vcoarse.pt"
-                tok_path = token_dir / token_name
+                tok_path = token_cache_candidates(token_dir, rel_img, "coarse")[0]
                 try:
-                    tok = self._load_tokens(str(tok_path))
+                    tok = load_first_cached_token(
+                        token_cache_candidates(token_dir, rel_img, "coarse")
+                    )
                 except Exception:
+                    if self.cfg.require_cached_tokens:
+                        raise RuntimeError(
+                            f"required coarse vision token is missing or invalid: {tok_path}"
+                        )
                     token_dir.mkdir(parents=True, exist_ok=True)
                     vc, vf = self._encode_image_tokens(abs_img)
                     try:
-                        torch.save(vc.half(), str(tok_path))
+                        atomic_torch_save(vc.half(), tok_path)
                     except Exception:
                         pass
                     tok = vc
@@ -560,11 +631,21 @@ class JsonTrackingDataset(Dataset):
                 else:
                     try:
                         if current_vc is None:
-                            cur_coarse_name = rel_curr.stem + "_vcoarse.pt"
-                            cur_coarse_path = curr_token_dir / cur_coarse_name
+                            cur_coarse_path = token_cache_candidates(
+                                curr_token_dir, rel_curr, "coarse"
+                            )[0]
                             try:
-                                current_vc = self._load_tokens(str(cur_coarse_path))
+                                current_vc = load_first_cached_token(
+                                    token_cache_candidates(
+                                        curr_token_dir, rel_curr, "coarse"
+                                    )
+                                )
                             except Exception:
+                                if self.cfg.require_cached_tokens:
+                                    raise RuntimeError(
+                                        "required current-frame coarse token is missing or invalid: "
+                                        f"{cur_coarse_path}"
+                                    )
                                 vc_tmp, _ = self._encode_image_tokens(abs_curr_img)
                                 current_vc = vc_tmp
                         tok = current_vc
@@ -610,6 +691,14 @@ class JsonTrackingDataset(Dataset):
             'delta_vel':     torch.tensor(ex.get('delta_vel', np.zeros((self.cfg.n_waypoints, 3))), dtype=torch.float32),
             'prev_action':   torch.tensor(ex.get('prev_action', [0.0, 0.0, 0.0]), dtype=torch.float32),
             'transition_type': str(ex.get('transition_type', 'other')),
+            'command':          str(ex.get('command', 'unknown')),
+            'source_raw_dir':   str(ex.get('source_raw_dir') or ex.get('episode', '')),
+            'episode':        str(ex.get('episode', '')),
+            'sequence_id':    str(ex.get('sequence_id', ex.get('chunk_id', ex.get('episode', '')))),
+            'chunk_id':       str(ex.get('chunk_id', ex.get('episode', ''))),
+            'clip_id':        str(ex.get('clip_id', ex.get('episode', ''))),
+            'frame_idx':      int(ex.get('frame_idx', idx)),
+            'mirrored':       bool(ex.get('mirrored', False)),
             'valid_mask':    vm,
             'instruction':   ex.get('instruction', 'follow the person'),
             'current_path':  str(abs_curr_img),
@@ -617,6 +706,19 @@ class JsonTrackingDataset(Dataset):
             'polar_dist_idx':  torch.tensor(int(ex.get('polar_dist_idx', -1)), dtype=torch.long),
             'polar_invalid':   torch.tensor(float(ex.get('polar_invalid', 1.0)), dtype=torch.float32),
         }
+        for horizon in (4, 8, 16):
+            item[f'fut_valid_{horizon}'] = torch.tensor(
+                bool(ex.get(f'fut_valid_{horizon}', False)), dtype=torch.bool
+            )
+            item[f'fut_vis_{horizon}'] = torch.tensor(
+                float(ex.get(f'fut_vis_{horizon}', 0.0)), dtype=torch.float32
+            )
+            item[f'fut_theta_idx_{horizon}'] = torch.tensor(
+                int(ex.get(f'fut_theta_idx_{horizon}', -1)), dtype=torch.long
+            )
+            item[f'fut_dist_idx_{horizon}'] = torch.tensor(
+                int(ex.get(f'fut_dist_idx_{horizon}', -1)), dtype=torch.long
+            )
         if 'bbox' in ex:
             bb = np.asarray(ex['bbox'], dtype=np.float32)
             if bb.size == 4:
@@ -674,7 +776,7 @@ class JsonTrackingDataset(Dataset):
 
 def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
     instr = [b['instruction'] for b in batch]
-    return {
+    result = {
         'coarse_tokens': torch.stack([b['coarse_tokens'] for b in batch], dim=0),
         'coarse_tidx':   torch.stack([b['coarse_tidx']   for b in batch], dim=0),
         'fine_tokens':   torch.stack([b['fine_tokens']   for b in batch], dim=0),
@@ -686,6 +788,14 @@ def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'delta_vel':     torch.stack([b['delta_vel']     for b in batch], dim=0),
         'prev_action':   torch.stack([b['prev_action']   for b in batch], dim=0),
         'transition_type': [b['transition_type'] for b in batch],
+        'command':          [b.get('command', 'unknown') for b in batch],
+        'source_raw_dir':   [b.get('source_raw_dir', b.get('episode', '')) for b in batch],
+        'episode':        [b['episode'] for b in batch],
+        'sequence_id':    [b['sequence_id'] for b in batch],
+        'chunk_id':       [b['chunk_id'] for b in batch],
+        'clip_id':        [b['clip_id'] for b in batch],
+        'frame_idx':      torch.tensor([b['frame_idx'] for b in batch], dtype=torch.long),
+        'mirrored':       torch.tensor([b['mirrored'] for b in batch], dtype=torch.bool),
         'valid_mask':    torch.stack([b['valid_mask']    for b in batch], dim=0),
         'instruction':   instr,
         'current_path':  [b['current_path'] for b in batch],
@@ -694,6 +804,11 @@ def collate_batch(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         'polar_dist_idx':  torch.stack([b['polar_dist_idx'] for b in batch], dim=0),
         'polar_invalid':   torch.stack([b['polar_invalid'] for b in batch], dim=0),
     }
+    for horizon in (4, 8, 16):
+        for field in ('fut_valid', 'fut_vis', 'fut_theta_idx', 'fut_dist_idx'):
+            key = f'{field}_{horizon}'
+            result[key] = torch.stack([b[key] for b in batch], dim=0)
+    return result
 
 
 # ----------------------- Inference -----------------------

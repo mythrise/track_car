@@ -89,7 +89,7 @@ def test_step_action_mode_never_calls_base_planner_and_rebuilds_waypoints():
     assert float(waypoints.abs().max()) < 1.0
 
 
-def test_absolute_mode_preserves_planner_and_inference_residual_behavior():
+def test_absolute_mode_trains_and_evaluates_the_same_verifier_residual():
     base = DummyBase(n_waypoints=2)
     base.planner = FixedPlanner(2)
     harness = PFEMHarness(base, label_mode="absolute")
@@ -102,7 +102,7 @@ def test_absolute_mode_preserves_planner_and_inference_residual_behavior():
         ctx, torch.ones(1), orch, delta
     )
     assert step_actions is None
-    assert torch.allclose(training_waypoints, torch.full((1, 2, 3), 0.25))
+    assert torch.allclose(training_waypoints, torch.full((1, 2, 3), 0.30))
 
     harness.eval()
     inference_waypoints, _ = harness._predict_tracking(ctx, torch.ones(1), orch, delta)

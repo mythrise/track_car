@@ -42,6 +42,7 @@ SUPPORTED_ACTION_SEMANTICS = {"spin_v1", "arc_turn_v2"}
 TURN_THRESHOLD = 0.2
 POLAR_THETA_BINS = 60
 POLAR_DISTANCE_BINS = 30
+MAX_PERSON_BBOX_AREA = 0.8
 TRAINING_SAMPLE_SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "training_sample.schema.json"
 
 
@@ -264,6 +265,20 @@ def estimate_target_from_frame(frame, detector=None):
     active_detector = detector or get_default_target_detector()
     detected, _ = active_detector.detect(frame)
     return detected
+
+
+def is_plausible_person_bbox(detected, max_area=MAX_PERSON_BBOX_AREA):
+    if detected is None:
+        return False
+    try:
+        _cx, _cy, width, height = [float(value) for value in detected]
+    except (TypeError, ValueError):
+        return False
+    return (
+        0.0 < width <= 1.0
+        and 0.0 < height <= 1.0
+        and width * height <= float(max_area)
+    )
 
 
 def theta_from_normalized_cx(cx, fov_deg=60):
@@ -616,6 +631,10 @@ def build_dataset(args, detector_factory=get_default_target_detector):
             detected, detection_source = (
                 detector.detect(frame, haar_result=haar_detection) if frame is not None else (None, "none")
             )
+            detection_rejected = None
+            if detected is not None and not is_plausible_person_bbox(detected):
+                detection_rejected = "bbox_area_or_bounds"
+                detected = None
             if detected is not None:
                 cx, cy, bbox_width, bbox_height = detected
                 theta_rad, dist_m = bbox_to_polar(
@@ -671,6 +690,8 @@ def build_dataset(args, detector_factory=get_default_target_detector):
                 "polar_invalid": invalid,
                 "detection_source": detection_source,
             }
+            if detection_rejected is not None:
+                sample["detection_rejected"] = detection_rejected
             if detected is not None:
                 sample["bbox"] = [
                     cx - bbox_width / 2.0,

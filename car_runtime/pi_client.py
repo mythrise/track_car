@@ -12,12 +12,12 @@ import sys
 import time
 
 try:
-    from camera_source import BACKENDS, open_camera
+    from camera_source import BACKENDS, FRAME_ROTATIONS, apply_frame_rotation, open_camera
     from car_hardware import MAX_SPEED, CarHardware, NEUTRAL, boosted_motors, motor_delta
     from car_protocol import recv_json, send_jpeg_frame, send_json
     from process_cleanup import cleanup_named_processes
 except ImportError:
-    from car_runtime.camera_source import BACKENDS, open_camera
+    from car_runtime.camera_source import BACKENDS, FRAME_ROTATIONS, apply_frame_rotation, open_camera
     from car_runtime.car_hardware import MAX_SPEED, CarHardware, NEUTRAL, boosted_motors, motor_delta
     from car_runtime.car_protocol import recv_json, send_jpeg_frame, send_json
     from car_runtime.process_cleanup import cleanup_named_processes
@@ -115,6 +115,13 @@ def main():
     ap.add_argument("--camera_fps", type=float, default=30.0)
     ap.add_argument("--camera_saturation", type=float, default=40.0)
     ap.add_argument("--camera_ready_timeout", type=float, default=5.0)
+    ap.add_argument(
+        "--frame_rotation",
+        type=int,
+        choices=FRAME_ROTATIONS,
+        default=0,
+        help="Rotate frames before inference. Use the same value as data collection.",
+    )
     ap.add_argument("--camera_warmup", type=float, default=1.0)
     ap.add_argument("--instruction", default="follow the person")
     ap.add_argument("--connect_timeout", type=float, default=5.0)
@@ -141,6 +148,7 @@ def main():
         "instruction": args.instruction,
         "width": args.width,
         "height": args.height,
+        "frame_rotation": args.frame_rotation,
     }
 
     try:
@@ -191,7 +199,7 @@ def main():
             ret, frame = cap.read()
             if not ret:
                 continue
-            frame = cv2.flip(frame, -1)
+            frame = apply_frame_rotation(frame, args.frame_rotation)
             send_jpeg_frame(sock, frame, quality=args.jpeg_quality)
 
             cmd = recv_json(sock)

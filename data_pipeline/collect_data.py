@@ -31,7 +31,7 @@ try:
         boosted_motors,
         command_from_key,
     )
-    from camera_source import BACKENDS, open_camera
+    from camera_source import BACKENDS, FRAME_ROTATIONS, apply_frame_rotation, open_camera
     from process_cleanup import cleanup_named_processes
     from wheel_trim import apply_trim
 except ImportError:
@@ -45,7 +45,7 @@ except ImportError:
         boosted_motors,
         command_from_key,
     )
-    from car_runtime.camera_source import BACKENDS, open_camera
+    from car_runtime.camera_source import BACKENDS, FRAME_ROTATIONS, apply_frame_rotation, open_camera
     from car_runtime.process_cleanup import cleanup_named_processes
     from car_runtime.wheel_trim import apply_trim
 
@@ -117,6 +117,13 @@ def main():
     ap.add_argument("--camera_fps", type=float, default=30.0)
     ap.add_argument("--camera_saturation", type=float, default=40.0)
     ap.add_argument("--camera_ready_timeout", type=float, default=5.0)
+    ap.add_argument(
+        "--frame_rotation",
+        type=int,
+        choices=FRAME_ROTATIONS,
+        default=0,
+        help="Rotate captured frames before saving. Use 180 only for an upside-down mount.",
+    )
     ap.add_argument("--camera_warmup", type=float, default=1.0)
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--out_root", default="data/collected")
@@ -212,7 +219,7 @@ def main():
             if not ret:
                 time.sleep(0.01)
                 continue
-            frame = cv2.flip(frame, -1)
+            frame = apply_frame_rotation(frame, args.frame_rotation)
             frame_kick_applied = False
             frame_kick_motors = None
 
@@ -297,6 +304,7 @@ def main():
             "camera_fps": args.camera_fps,
             "camera_saturation": args.camera_saturation,
             "camera_ready_timeout": args.camera_ready_timeout,
+            "frame_rotation": args.frame_rotation,
             "teleop": args.teleop,
             "speed": speed,
             "kick_speed": kick_speed,

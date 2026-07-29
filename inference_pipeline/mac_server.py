@@ -317,6 +317,7 @@ def load_model(
     control_dt=0.1,
     aux_delta_vel=False,
     allow_random_init=False,
+    strict_checkpoint=False,
 ):
     sys.path.insert(0, str(opentrackvla_root))
     from model import OpenTrackVLA, ModelConfig
@@ -332,16 +333,30 @@ def load_model(
         )
         base = OpenTrackVLA(mcfg, vision_feat_dim=1536)
     base = base.to(device)
+    disabled_components = set()
+    if isinstance(checkpoint, dict) and isinstance(checkpoint.get("meta"), dict):
+        disabled_components = set(checkpoint["meta"].get("disabled_components") or [])
     model = PFEMHarness(
         base,
         label_mode=label_mode,
         dt=control_dt,
         aux_delta_vel=aux_delta_vel,
+        use_cot_loss="cot_loss" not in disabled_components,
+        use_tim="tim" not in disabled_components,
+        use_future="future" not in disabled_components,
+        use_verifier="verifier" not in disabled_components,
+        use_events="events" not in disabled_components,
+        use_orchestrator="orchestrator" not in disabled_components,
     ).to(device).eval()
     if checkpoint is not None:
         model_state = checkpoint.get("model_state", {})
         missing, unexpected = model.load_state_dict(model_state, strict=False)
         missing = [key for key in missing if not key.startswith("base.llm.")]
+        if strict_checkpoint and (missing or unexpected):
+            raise RuntimeError(
+                "checkpoint state mismatch: "
+                f"missing={missing}, unexpected={unexpected}"
+            )
         critical_missing = [
             key
             for key in missing

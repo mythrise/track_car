@@ -18,6 +18,8 @@ class Verifier(nn.Module):
         )
         self.q_head = nn.Linear(256, 1)
         self.delta_head = nn.Linear(256, n_waypoints * action_dims)
+        nn.init.zeros_(self.delta_head.weight)
+        nn.init.zeros_(self.delta_head.bias)
 
     def forward(self, f_t, tim_mean, h_t, fut_mean):
         z = self.trunk(torch.cat([f_t, tim_mean, h_t, fut_mean], dim=-1))

@@ -17,8 +17,24 @@ OPENTRACKVLA_ROOT = Path(__file__).resolve().parent
 TRACK_CAR_ROOT = OPENTRACKVLA_ROOT.parents[1]
 
 
+def _is_xsym_placeholder(path: Path) -> bool:
+    """Return true for macOS archive placeholders standing in for symlinks."""
+
+    try:
+        with path.open("rb") as handle:
+            return handle.readline().rstrip(b"\r\n") == b"XSym"
+    except OSError:
+        return False
+
+
 def _has_config(path: Path) -> bool:
-    return path.exists() and path.is_dir() and (path / "config.json").exists()
+    config = path / "config.json"
+    return (
+        path.exists()
+        and path.is_dir()
+        and config.is_file()
+        and not _is_xsym_placeholder(config)
+    )
 
 
 def _snapshot_with_config(path: Path) -> Path | None:
@@ -28,7 +44,11 @@ def _snapshot_with_config(path: Path) -> Path | None:
     snapshots = path / "snapshots"
     choices = [p for p in snapshots.iterdir() if _has_config(p)] if snapshots.exists() else []
     if not choices:
-        nested_configs = list(path.glob("*/snapshots/*/config.json"))
+        nested_configs = [
+            config
+            for config in path.glob("*/snapshots/*/config.json")
+            if _has_config(config.parent)
+        ]
         if not nested_configs:
             return None
         choices = [p.parent for p in nested_configs]
@@ -65,18 +85,33 @@ def resolve_local_model_path(
 ) -> str:
     checked: list[Path] = []
 
-    ordered: list[Path] = []
+    # A real explicit local path is authoritative and must not be shadowed by
+    # an environment variable.  A value equal to repo_id is merely the common
+    # Transformers repository identifier and therefore falls through to local
+    # candidates/offline caches.
+    explicit_path = _path_from(explicit)
+    explicit_text = str(explicit).strip() if explicit is not None else ""
+    if explicit_path is not None and explicit_text != repo_id:
+        checked.append(explicit_path)
+        resolved = _snapshot_with_config(explicit_path)
+        if resolved is None:
+            raise FileNotFoundError(
+                f"{label} explicit local model path is invalid: {explicit_path}"
+            )
+        return str(resolved.resolve())
+
     if env_var:
         env_path = _path_from(os.getenv(env_var))
         if env_path is not None:
-            ordered.append(env_path)
+            checked.append(env_path)
+            resolved = _snapshot_with_config(env_path)
+            if resolved is None:
+                raise FileNotFoundError(
+                    f"{label} environment path {env_var} is invalid: {env_path}"
+                )
+            return str(resolved.resolve())
 
-    explicit_path = _path_from(explicit)
-    if explicit_path is not None and "/" not in str(explicit_path).replace("\\", "/"):
-        ordered.append(explicit_path)
-    elif explicit_path is not None and explicit_path.exists():
-        ordered.append(explicit_path)
-
+    ordered: list[Path] = []
     ordered.extend(Path(p).expanduser() for p in candidates)
     ordered.append(_hf_cache_root() / _cache_dir_name(repo_id))
 
@@ -105,14 +140,21 @@ def resolve_local_model_path(
 
 def default_qwen_candidates() -> list[Path]:
     return [
+        TRACK_CAR_ROOT.parent / "resolved_models" / "Qwen3-0.6B",
         OPENTRACKVLA_ROOT / "ckpts_hf" / "qwen3-0.6b",
         OPENTRACKVLA_ROOT / "ckpts_hf" / "Qwen3-0.6B",
+        TRACK_CAR_ROOT.parent / "models--Qwen--Qwen3-0.6B",
     ]
 
 
 def default_siglip_candidates() -> list[Path]:
     return [
+        TRACK_CAR_ROOT.parent
+        / "resolved_models"
+        / "siglip-so400m-patch14-384",
         OPENTRACKVLA_ROOT / "ckpts_hf" / "siglip-so400m-patch14-384",
+        TRACK_CAR_ROOT.parent
+        / "models--google--siglip-so400m-patch14-384",
     ]
 
 

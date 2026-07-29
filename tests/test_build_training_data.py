@@ -28,6 +28,15 @@ class HaarStubDetector:
         return haar_result, "haar"
 
 
+class FullFrameStubDetector:
+    def detect_haar(self, _frame):
+        return None
+
+    def detect(self, _frame, haar_result=None):
+        assert haar_result is None
+        return (0.5, 0.5, 0.999, 0.999), "omdet"
+
+
 def write_episode(root: Path, *, empty_meta_index=None):
     episode = root / "collected" / "ep001"
     episode.mkdir(parents=True)
@@ -154,6 +163,20 @@ def test_haar_distance_uses_vertical_position_instead_of_full_body_height(tmp_pa
     assert manifest["statistics"]["polar_by_detection_source"]["haar"][
         "max_distance_bin_rate"
     ] == 0.0
+
+
+def test_near_full_frame_detection_is_excluded_from_polar_labels(tmp_path, monkeypatch):
+    monkeypatch.setattr(builder, "PROJECT_ROOT", tmp_path)
+    write_episode(tmp_path)
+    samples, manifest = builder.build_dataset(
+        args_for(tmp_path),
+        detector_factory=lambda device: FullFrameStubDetector(),
+    )
+    assert samples
+    assert {sample["polar_invalid"] for sample in samples} == {1.0}
+    assert all("bbox" not in sample for sample in samples)
+    assert {sample["detection_rejected"] for sample in samples} == {"bbox_area_or_bounds"}
+    assert manifest["statistics"]["polar_valid"] == 0
 
 
 def test_empty_meta_fails_closed_before_detector_load(tmp_path, monkeypatch):

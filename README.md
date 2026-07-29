@@ -148,6 +148,21 @@ python data_pipeline/build_training_data.py \
   --output data/car_train.jsonl
 ```
 
+If the source is already a single episode directory, use the dedicated adapter
+instead of pointing the multi-episode builder at it:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+conda run --no-capture-output -n pytorch \
+python -m data_preprocess.prepare_collected_episode \
+  --episode data/test006 \
+  --output data/test006_train.jsonl \
+  --processed_episode_dir data/processed/test006 \
+  --rotate_180_all \
+  --keep_orientation_frames 0 200 \
+  --detector_device mps
+```
+
 Conversion uses OmDet-Turbo person boxes when available, with a warned Haar
 fallback. The default `step_action` samples include `step_actions`,
 `prev_action`, and `delta_vel`. The sidecar manifest binds the JSONL by SHA-256

@@ -12,6 +12,18 @@ import cv2
 
 
 BACKENDS = ("auto", "v4l2", "opencv", "picamera2")
+FRAME_ROTATIONS = (0, 180)
+
+
+def apply_frame_rotation(frame, degrees: int):
+    """Return a frame in the configured camera orientation."""
+
+    degrees = int(degrees)
+    if degrees == 0:
+        return frame
+    if degrees == 180:
+        return cv2.flip(frame, -1)
+    raise ValueError(f"Unsupported frame rotation: {degrees}")
 
 
 def cv_backend(name: str):

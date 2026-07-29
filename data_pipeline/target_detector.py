@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Callable
@@ -16,6 +17,70 @@ def _offline_mode() -> bool:
     return os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
 
 
+def explicit_omdet_config(raw_config: dict):
+    """Convert legacy timm backbone fields without a Hugging Face Hub lookup."""
+
+    from transformers import OmDetTurboConfig, TimmBackboneConfig
+
+    raw_config = dict(raw_config)
+    if raw_config.get("backbone_config") is None and raw_config.get("use_timm_backbone"):
+        backbone_kwargs = dict(raw_config.get("backbone_kwargs") or {})
+        backbone_config = TimmBackboneConfig(
+            backbone=str(raw_config.get("backbone", "swin_tiny_patch4_window7_224")),
+            out_indices=backbone_kwargs.get(
+                "out_indices",
+                raw_config.get("backbone_out_indices", [1, 2, 3]),
+            ),
+            features_only=True,
+            use_pretrained_backbone=False,
+            **{
+                key: backbone_kwargs[key]
+                for key in ("img_size", "always_partition")
+                if key in backbone_kwargs
+            },
+        )
+        for key in ("backbone_config", "backbone_kwargs", "backbone_out_indices"):
+            raw_config.pop(key, None)
+        raw_config["backbone_config"] = backbone_config.to_dict()
+        # Transformers 4.x constructor defaults reintroduce the legacy string
+        # backbone unless these are explicit; 5.x also accepts this canonical
+        # backbone_config-only representation.
+        raw_config["backbone"] = None
+        raw_config["use_timm_backbone"] = False
+        raw_config["use_pretrained_backbone"] = False
+    return OmDetTurboConfig.from_dict(raw_config)
+
+
+def normalize_omdet_state_dict(state: dict, expected_keys=None) -> dict:
+    """Map checkpoint keys only when the instantiated model expects 5.x names."""
+
+    legacy_prefix = "language_backbone.model.text_model."
+    current_prefix = "language_backbone.model."
+    if expected_keys is not None:
+        expected_keys = tuple(expected_keys)
+        if any(key.startswith(legacy_prefix) for key in expected_keys):
+            return dict(state)
+        expects_current = any(
+            key.startswith(current_prefix) and not key.startswith(legacy_prefix)
+            for key in expected_keys
+        )
+        if not expects_current:
+            return dict(state)
+    return {
+        (current_prefix + key[len(legacy_prefix) :] if key.startswith(legacy_prefix) else key): value
+        for key, value in state.items()
+    }
+
+
+def transformers_major_version(version: str) -> int:
+    digits = []
+    for character in str(version).split(".", 1)[0]:
+        if not character.isdigit():
+            break
+        digits.append(character)
+    return int("".join(digits)) if digits else 0
+
+
 def load_omdet_components(device: str = "cpu"):
     """Load OmDet the same way for dataset building and model-side bbox use.
 
@@ -25,7 +90,8 @@ def load_omdet_components(device: str = "cpu"):
 
     from huggingface_hub import hf_hub_download
     from safetensors.torch import load_file
-    from transformers import AutoConfig, AutoProcessor, OmDetTurboForObjectDetection
+    import transformers
+    from transformers import AutoProcessor, OmDetTurboForObjectDetection
 
     kwargs = {"local_files_only": True} if _offline_mode() else {}
     processor = AutoProcessor.from_pretrained(OMDET_MODEL_ID, **kwargs)
@@ -33,10 +99,16 @@ def load_omdet_components(device: str = "cpu"):
     # leaves the timm swin backbone's non-persistent attn_mask buffers on the
     # meta device (they are not in the checkpoint), and .to(device) then fails
     # with "Cannot copy out of meta tensor".
-    config = AutoConfig.from_pretrained(OMDET_MODEL_ID, **kwargs)
+    if transformers_major_version(transformers.__version__) < 5:
+        config = transformers.AutoConfig.from_pretrained(OMDET_MODEL_ID, **kwargs)
+    else:
+        config_path = hf_hub_download(OMDET_MODEL_ID, "config.json", **kwargs)
+        with open(config_path, encoding="utf-8") as handle:
+            config = explicit_omdet_config(json.load(handle))
     model = OmDetTurboForObjectDetection(config)
     state_path = hf_hub_download(OMDET_MODEL_ID, "model.safetensors", **kwargs)
-    missing, unexpected = model.load_state_dict(load_file(state_path), strict=False)
+    state = normalize_omdet_state_dict(load_file(state_path), model.state_dict().keys())
+    missing, unexpected = model.load_state_dict(state, strict=False)
     if missing or unexpected:
         raise RuntimeError(
             f"OmDet-Turbo weights incomplete: {len(missing)} missing, {len(unexpected)} unexpected"

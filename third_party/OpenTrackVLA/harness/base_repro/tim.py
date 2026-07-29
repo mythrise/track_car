@@ -1,10 +1,11 @@
 """Target Identification Memory (TIM) — 4-token long-horizon identity memory.
 
-TrackVLA++ multiplicative gate: g = w * q_write, where
-w = C_{t-1} / (C_avg + C_{t-1}).
+TrackVLA++ confidence gate: w = C_{t-1} / (C_avg + C_{t-1}).
+The optional q_write multiplier is a PFEM extension; TrackVLA++-Lite passes 1.
 """
 
 from __future__ import annotations
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,7 +33,7 @@ class TIM(nn.Module):
 
     def update(self, state: dict, candidate: torch.Tensor,
                C: torch.Tensor, q_write: torch.Tensor,
-               invalid_mask=None) -> dict:
+               invalid_mask=None, *, count_invalid_in_average: bool = False) -> dict:
         B = candidate.size(0)
         g = self.compute_gate(C, q_write, state)
         if invalid_mask is not None:
@@ -45,7 +46,17 @@ class TIM(nn.Module):
         if first_valid.any():
             fv = first_valid.view(B, 1, 1)
             new_mem = torch.where(fv, candidate + self.slot_emb.unsqueeze(0), new_mem)
-        valid_inc = (~invalid_mask).long() if invalid_mask is not None else torch.ones(B, dtype=torch.long, device=C.device)
+        initialized_inc = (
+            (~invalid_mask)
+            if invalid_mask is not None
+            else torch.ones(B, dtype=torch.bool, device=C.device)
+        )
+        if count_invalid_in_average:
+            # TrackVLA++ Eq. (4)-(5): invalid implies C=0 but still occupies a
+            # timestep in the historical confidence average.
+            valid_inc = torch.ones(B, dtype=torch.long, device=C.device)
+        else:
+            valid_inc = (~invalid_mask).long() if invalid_mask is not None else torch.ones(B, dtype=torch.long, device=C.device)
         C_valid = C.masked_fill(invalid_mask, 0.0) if invalid_mask is not None else C
         new_cnt = state["C_cnt"] + valid_inc
         new_avg = (state["C_avg"] * state["C_cnt"].float() + C_valid) / new_cnt.clamp_min(1).float()
@@ -53,17 +64,37 @@ class TIM(nn.Module):
             "mem": new_mem,
             "C_avg": new_avg,
             "C_cnt": new_cnt,
-            "initialized": state["initialized"] | (valid_inc > 0),
+            "initialized": state["initialized"] | initialized_inc,
             "last_gate": g,
         }
 
 
 def roi_pool_candidate(v_fine: torch.Tensor, theta_idx: torch.Tensor,
-                       n_theta: int, n_tokens: int = 4) -> torch.Tensor:
-    """Pool V_fine (B, N, D) into n_tokens candidate tokens guided by theta sector."""
+                       n_theta: int, n_tokens: int = 4,
+                       horizontal_fov_deg: float = 60.0) -> torch.Tensor:
+    """Select spatial 8x8-grid tokens from the Polar-CoT horizontal sector.
+
+    Grid-pooled fine tokens are row-major image patches.  Polar angle controls
+    the image column; it must not be compared with the flattened token index.
+    Without a vertical target coordinate, ``n_tokens`` rows are sampled down
+    that column to retain top-to-bottom appearance cues for identity memory.
+    Angles outside the single-camera FoV clamp to the nearest edge column.
+    """
     B, N, D = v_fine.shape
-    sectors = torch.linspace(0, n_theta - 1, N, device=v_fine.device)
-    targets = theta_idx.float().unsqueeze(-1)
-    weight = torch.softmax(-((sectors.unsqueeze(0) - targets) ** 2) / 4.0, dim=-1)
-    weighted = (weight.unsqueeze(-1) * v_fine).sum(dim=1)
-    return weighted.unsqueeze(1).expand(-1, n_tokens, -1).contiguous()
+    side = math.isqrt(N)
+    if side * side != N:
+        raise ValueError(f"fine token count must form a square grid, got N={N}")
+    if n_tokens <= 0:
+        raise ValueError("n_tokens must be positive")
+    theta_deg = (theta_idx.float() + 0.5) * (360.0 / float(n_theta)) - 180.0
+    normalized_x = (theta_deg + horizontal_fov_deg / 2.0) / horizontal_fov_deg
+    columns = torch.round(normalized_x.clamp(0.0, 1.0) * (side - 1)).long()
+    rows = torch.linspace(0, side - 1, steps=n_tokens, device=v_fine.device)
+    rows = torch.round(rows).long()
+    grid = v_fine.view(B, side, side, D)
+    batch_index = torch.arange(B, device=v_fine.device).unsqueeze(1)
+    return grid[
+        batch_index,
+        rows.unsqueeze(0).expand(B, -1),
+        columns.unsqueeze(1).expand(-1, n_tokens),
+    ].contiguous()

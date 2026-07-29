@@ -64,6 +64,10 @@ def test_ws2_training_cli_defaults():
     assert args.lambda_yaw == 2.0
     assert args.aux_delta_vel is False
     assert args.balance_sampling is True
+    assert args.state_mode == "rolling"
+    assert args.batch_size == 1
+    assert args.grad_accum_steps == 2
+    assert args.save_optimizer is False
 
 
 def test_checkpoint_meta_uses_step_action_manifest_and_delta_scale(tmp_path):
@@ -139,3 +143,25 @@ def test_balanced_sampler_is_not_used_when_events_already_meet_target():
             return self.examples[index]
 
     assert train_pfem.build_training_sampler(Dataset(), enabled=True) is None
+
+
+def test_main_interrupt_records_interrupted_run_and_reraises(monkeypatch, tmp_path):
+    logger = train_pfem.JsonlMetricLogger(tmp_path)
+    logger.start_run(
+        args={"seed": 0},
+        checkpoint_meta={"checkpoint_selection": {"metric": "BCE", "mode": "min"}},
+        total_params=1,
+        trainable_params=1,
+        install_exception_hook=False,
+    )
+
+    def interrupt():
+        train_pfem._ACTIVE_METRIC_LOGGER = logger
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(train_pfem, "_main_impl", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        train_pfem.main()
+    records = [json.loads(line) for line in logger.path.read_text().splitlines()]
+    assert records[-1]["phase"] == "run_end"
+    assert records[-1]["status"] == "interrupted"

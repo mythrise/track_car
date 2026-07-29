@@ -52,7 +52,10 @@ class CognitiveEventBank(nn.Module):
                     slot = int(idxs[new["age"][b][same].argmax()].item())
                 else:
                     slot = int(new["age"][b].argmax().item())
-            new["tokens"][b, slot] = tok.detach()
+            # The rolling trainer detaches state between steps. Keep the
+            # current write differentiable so the event encoder can learn from
+            # the current action loss.
+            new["tokens"][b, slot] = tok
             new["types"][b, slot] = type_id
             new["age"][b, slot] = 0
         return new

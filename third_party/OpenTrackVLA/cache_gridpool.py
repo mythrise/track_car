@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import os
 import json
 import math
+import tempfile
 from pathlib import Path
 
 import torch
@@ -23,6 +24,52 @@ from local_weights import (
 
 def ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
+
+
+def token_cache_filename(image_path: str | Path, level: str) -> str:
+    """Return a collision-safe cache filename while preserving image suffix."""
+
+    suffix = {"fine": "vfine", "coarse": "vcoarse"}.get(level)
+    if suffix is None:
+        raise ValueError(f"unknown vision token level: {level!r}")
+    return f"{Path(image_path).name}_{suffix}.pt"
+
+
+def legacy_token_cache_filename(image_path: str | Path, level: str) -> str:
+    """Return the pre-v2 filename for read-only backward compatibility."""
+
+    suffix = {"fine": "vfine", "coarse": "vcoarse"}.get(level)
+    if suffix is None:
+        raise ValueError(f"unknown vision token level: {level!r}")
+    return f"{Path(image_path).stem}_{suffix}.pt"
+
+
+def atomic_torch_save(value, destination: str | Path) -> None:
+    """Persist a torch payload atomically so interrupted writes are never valid."""
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # A per-image slice such as ``batched_tokens[index]`` can be logically
+    # contiguous while still referencing the entire batched storage with a
+    # non-zero storage offset.  ``torch.save`` serializes that backing storage,
+    # which made every cached token file roughly ``batch_size`` times larger
+    # than its tensor payload.  Give tensor payloads compact owned storage
+    # before serializing them.
+    if isinstance(value, torch.Tensor):
+        value = value.detach().clone(memory_format=torch.contiguous_format)
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=str(destination.parent),
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    handle.close()
+    try:
+        torch.save(value, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def to_device(x, device: torch.device):
@@ -204,7 +251,15 @@ def adapt_siglip_grid(tokens: torch.Tensor, grid_hw: Optional[Tuple[int, int]] =
         Hs, Ws = grid_hw
         assert Hs * Ws == P_s
     feat = tokens.transpose(1, 2).contiguous().view(B, C_s, Hs, Ws)
-    feat = F.adaptive_avg_pool2d(feat, output_size=out_hw)
+    # MPS currently rejects non-divisible adaptive pooling such as 27x27 to
+    # 24x24. Pool this small token grid on CPU, then return it to the model
+    # device; the expensive SigLIP encoder still runs on MPS.
+    if tokens.device.type == "mps" and (Hs % out_hw[0] or Ws % out_hw[1]):
+        feat = F.adaptive_avg_pool2d(
+            feat.float().cpu(), output_size=out_hw
+        ).to(tokens.device, dtype=tokens.dtype)
+    else:
+        feat = F.adaptive_avg_pool2d(feat, output_size=out_hw)
     pooled = feat.flatten(2).transpose(1, 2).contiguous()  # (B, 24*24, C_s) if out_hw=(24,24)
     return pooled
 
@@ -220,7 +275,8 @@ class VisionCacheConfig:
     image_size: int = 384          # enforce 384 for both towers
     batch_size: int = 24
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype: torch.dtype = torch.float16  # for storage; compute still in fp32
+    dtype: torch.dtype = torch.float16  # storage dtype
+    compute_dtype: torch.dtype = torch.float32
     force_square_resize: bool = True    # ensure exact 384x384
 
     def __post_init__(self):
@@ -245,10 +301,13 @@ class VisionFeatureCacher(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.device = torch.device(cfg.device)
+        self.compute_dtype = (
+            cfg.compute_dtype if self.device.type != "cpu" else torch.float32
+        )
         # DINOv3
         self.dino_proc = AutoImageProcessor.from_pretrained(cfg.dino_model_name, local_files_only=True)
         self.dino = AutoModel.from_pretrained(cfg.dino_model_name, local_files_only=True)
-        self.dino.eval().to(self.device)
+        self.dino.eval().to(self.device, dtype=self.compute_dtype)
         self.dino_patch = getattr(self.dino.config, 'patch_size', None)
         # Default to 0 registers when field is missing
         self.dino_regs = int(getattr(self.dino.config, 'num_register_tokens', 0) or 0)
@@ -256,7 +315,7 @@ class VisionFeatureCacher(nn.Module):
         # SigLIP (vision)
         self.siglip_proc = SiglipImageProcessor.from_pretrained(cfg.siglip_model_name, local_files_only=True)
         self.siglip = SiglipVisionModel.from_pretrained(cfg.siglip_model_name, local_files_only=True)
-        self.siglip.eval().to(self.device)
+        self.siglip.eval().to(self.device, dtype=self.compute_dtype)
         self.siglip_hidden = getattr(self.siglip.config, 'hidden_size', 1152)
 
     # ---------------------------------------
@@ -269,7 +328,15 @@ class VisionFeatureCacher(nn.Module):
             inputs = self.dino_proc(images=pil_list, return_tensors="pt", size={"height": self.cfg.image_size, "width": self.cfg.image_size})
         else:
             inputs = self.siglip_proc(images=pil_list, return_tensors="pt", size={"height": self.cfg.image_size, "width": self.cfg.image_size})
-        return {k: to_device(v, self.device) for k, v in inputs.items()}
+        moved = {k: to_device(v, self.device) for k, v in inputs.items()}
+        return {
+            key: (
+                value.to(dtype=self.compute_dtype)
+                if torch.is_floating_point(value)
+                else value
+            )
+            for key, value in moved.items()
+        }
 
     @torch.inference_mode()
     def _encode_dino(self, pil_list: List[Image.Image]) -> Tuple[torch.Tensor, int, int]:
@@ -406,11 +473,15 @@ class VisionFeatureCacher(nn.Module):
             if save_per_view:
                 # Save two files per view using original filename base
                 for v in range(V):
-                    base_name = os.path.splitext(os.path.basename(filenames_by_view[v][t]))[0]
-                    vf_path = os.path.join(seq_dir, f"{base_name}_vfine.pt")
-                    vc_path = os.path.join(seq_dir, f"{base_name}_vcoarse.pt")
-                    torch.save(Vfine[v].to(self.cfg.dtype), vf_path)
-                    torch.save(Vcoarse[v].to(self.cfg.dtype), vc_path)
+                    filename = filenames_by_view[v][t]
+                    vf_path = os.path.join(
+                        seq_dir, token_cache_filename(filename, "fine")
+                    )
+                    vc_path = os.path.join(
+                        seq_dir, token_cache_filename(filename, "coarse")
+                    )
+                    atomic_torch_save(Vfine[v].to(self.cfg.dtype), vf_path)
+                    atomic_torch_save(Vcoarse[v].to(self.cfg.dtype), vc_path)
             else:
                 St = {
                     "V_dino": Vt_dino.to(self.cfg.dtype),
