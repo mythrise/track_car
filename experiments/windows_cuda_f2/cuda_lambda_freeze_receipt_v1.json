@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "analysis_class": "f2_lambda_freeze",
+  "date": "2026-07-20",
+  "reviewer": {
+    "model": "mechanical-protocol-freeze",
+    "role": "Windows CUDA experiment executor; verbatim adoption of the preregistered deterministic CAL v3 proposal"
+  },
+  "action": "Adopt the byte-identical Windows CUDA seeded CAL v3 lambda proposal verbatim and freeze it as source literals under adjudication ruling b as amended by f2-adjudication-amendment-1.",
+  "frozen_values": {
+    "L_cot": 0.0195,
+    "L_future": 0.34,
+    "L_verify": 0.5
+  },
+  "mechanism": "lambda_i = 0.5 * min_j(median||g_aux_j||) / median||g_aux_i||, each capped at 1.0; 3 significant digits; computed on base.proj over 512 CAL rows at zero optimizer updates",
+  "evidence": {
+    "cal_audit_receipt": {
+      "path": "experiments/windows_cuda_f2/cal_audit_cuda_v3/cal_audit_receipt_v1.json",
+      "sha256": "e2b87cc3a088d68813349a3f33cb77db94eb43d2ff6c97659e45541479fee778",
+      "bytes": 4347,
+      "seed": 0,
+      "device": "cuda:0",
+      "checkpoint_init_sha256": "74f838e314dd6f3b208dbed23e0e7a92dcdde09bb7d79b0ce8c1147d9b251e54",
+      "step0_parity": "512 rows, 0 failures",
+      "prev_free_graph_audit": "512 rows, 0 failures",
+      "ap2_zero_init_proof": "512 rows, 0 violations; track_grad_norm_max=0.0"
+    },
+    "deterministic_reproduction": {
+      "path": "experiments/windows_cuda_f2/cal_audit_cuda_v3_repro/cal_audit_receipt_v1.json",
+      "sha256": "e2b87cc3a088d68813349a3f33cb77db94eb43d2ff6c97659e45541479fee778",
+      "bytes": 4347,
+      "byte_identical": true,
+      "comparison": "byte-identical to cal_audit_cuda_v3 by SHA-256, file length, and ReadAllBytes comparison"
+    },
+    "bootstrap_assembly_receipt": {
+      "path": "experiments/windows_cuda_f2/assembly_receipt_cuda_bootstrap_v4.json",
+      "sha256": "5aa6cc8ba13755bf65fe11e2f4573842c53309226f0b9226bba5de5bb9cc86a7",
+      "receipt_payload_sha256": "8745585d9237744e5071f99337689d3f24759ee49f62344249d5abac1c881ea9"
+    },
+    "cuda_reproducibility": {
+      "contract_id": "windows_cuda_deterministic_v1",
+      "torch_version": "2.6.0+cu124",
+      "cuda_runtime": "12.4",
+      "cublas_workspace_config": ":4096:8",
+      "deterministic_algorithms": true,
+      "deterministic_warn_only": false,
+      "cudnn_deterministic": true,
+      "cudnn_benchmark": false,
+      "matmul_allow_tf32": false,
+      "cudnn_allow_tf32": false,
+      "float32_matmul_precision": "highest",
+      "sdpa_backend": "math_only"
+    },
+    "gradient_medians": {
+      "L_cot": 13.100267518450678,
+      "L_future": 0.7527186011353795,
+      "L_verify": 0.5114651815582008
+    },
+    "source_literal_site": "f2_experiment/assembly_model.py FROZEN_AUX_COEFFICIENTS",
+    "test_pin": "tests/f2/test_assembly_model.py::test_frozen_aux_coefficients_pin_windows_cuda_cal_v3_values"
+  },
+  "preregistration_status": "Frozen after two byte-identical Windows CUDA seeded CAL v3 runs and before any smoke optimizer update or smoke EVAL-FIX result was observed.",
+  "internal_test": "sealed",
+  "internal_test_opened": false,
+  "recorded_at_utc": "2026-07-19T18:23:30Z"
+}

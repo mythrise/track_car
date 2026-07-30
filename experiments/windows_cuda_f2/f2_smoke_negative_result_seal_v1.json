@@ -1,0 +1,114 @@
+{
+  "schema_version": 1,
+  "analysis_class": "f2_authoritative_smoke_negative_result_seal",
+  "date": "2026-07-20",
+  "architecture_lock": "L1+D2+AP2+F2",
+  "run": {
+    "path": "experiments/windows_cuda_f2/smoke_cuda_v1",
+    "started_at": "2026-07-20T02:39:14.8959789+08:00",
+    "completed_at": "2026-07-20T02:51:46.4218569+08:00",
+    "duration_seconds": 751.526,
+    "valid_input": true,
+    "engineering_failure": false,
+    "scientific_negative_result": true
+  },
+  "authority": {
+    "assembly_receipt_sha256": "330993715527df5a87888d9c477d73a82af213fec11cda290bec9412a2aecd19",
+    "assembly_receipt_payload_sha256": "b40e3cf14448afd020a2ece55b1abc4e36619e05a27287b75982561baad22db4",
+    "cal_main_sha256": "e2b87cc3a088d68813349a3f33cb77db94eb43d2ff6c97659e45541479fee778",
+    "cal_reproduction_sha256": "e2b87cc3a088d68813349a3f33cb77db94eb43d2ff6c97659e45541479fee778",
+    "lambda_freeze_sha256": "75a9823513ed96eadbb00d1b0a8d7b364900c1d3fbb5523522adc89e29ab9e14",
+    "bootstrap_receipt_sha256": "5aa6cc8ba13755bf65fe11e2f4573842c53309226f0b9226bba5de5bb9cc86a7",
+    "bootstrap_payload_sha256": "8745585d9237744e5071f99337689d3f24759ee49f62344249d5abac1c881ea9",
+    "chain": "via_lambda_freeze_supersede",
+    "frozen_lambda": {
+      "L_cot": 0.0195,
+      "L_future": 0.34,
+      "L_verify": 0.5
+    }
+  },
+  "evidence": {
+    "smoke_summary": {
+      "path": "experiments/windows_cuda_f2/smoke_cuda_v1/smoke_summary.json",
+      "sha256": "3c7144a2e8f07e558ddad654e2ab0abae9fab2e827729c0ba3b5de5ab7d40f99"
+    },
+    "combined_gate_receipt": {
+      "path": "experiments/windows_cuda_f2/smoke_cuda_v1/combined_smoke_gate_receipt.json",
+      "sha256": "689f3937e079db1e7a2d0c5fa8643c06dc14d9b0ca4359cc9c47805ba69ebe0f"
+    },
+    "count_receipt": {
+      "path": "experiments/windows_cuda_f2/smoke_cuda_v1/count_receipt.json",
+      "sha256": "90acf1e1d4c19c51e03ae154121caf57e39a1e48df1df09571b2ab51522f4937"
+    },
+    "completion": {
+      "path": "experiments/windows_cuda_f2/runtime/smoke_cuda_v1.completion.json",
+      "sha256": "704fdd70cd84838cd5567ca36712480c08598b87f10c5c00382065de7a8efdf2",
+      "observed_exit_code": null
+    },
+    "exit_code_adjudication": {
+      "path": "experiments/windows_cuda_f2/runtime/smoke_cuda_v1.exit_code_adjudication_v1.json",
+      "sha256": "17afd4d8a28957aa1ed2808cab6e3953223faf1913f6ea96360c9599aa23fee7",
+      "contract_derived_exit_code": 2,
+      "contract_derived_exit_code_is_os_observation": false
+    },
+    "gpu_telemetry": {
+      "path": "experiments/windows_cuda_f2/runtime/smoke_cuda_v1.gpu.csv",
+      "sha256": "3bb1c8e8113c50878887d1fb6355a7541afe941e866424cf666f859d56dd9321",
+      "rows": 160,
+      "effective_process_window_samples": 150
+    }
+  },
+  "gate_outcomes": {
+    "G6": {
+      "status": "FAIL",
+      "receipt_sha256": "26c1c5bb680d9c8ad85f7a3979a367e264aac3e89399ccc8b9f8957da7f2adff",
+      "aux_track_ratio_median": 6.442171203151501,
+      "aux_track_ratio_max": 1.5,
+      "cosine_median": 0.23840509526322365,
+      "cosine_median_min": 0.6,
+      "positive_projection_count": 80,
+      "positive_projection_min": 108,
+      "reachability_checks_passed": true
+    },
+    "G7": {
+      "status": "PASS",
+      "S-CTRL_receipt_sha256": "194787e4fd4db9a65c93576c5ac87b5c72e7f5e6436b0d290aaac020a05ea6be",
+      "S-SELF_receipt_sha256": "e35be8898ec30ad2cb5d43a0538f2f5d2ad42a6163259d3489cd0a5cbf9dc414",
+      "both_arms_zero_saturation": true
+    },
+    "G8": {
+      "status": "FAIL",
+      "receipt_sha256": "15e91734a76bd937521685cc536050627d1384df05fa34abe6b2f92d68d9ef02",
+      "self_mode_overall_delta": 0.01259260849428756,
+      "required_delta_max": -0.000001,
+      "all_improvement_strata_failed": true,
+      "gap_contraction_failed": true,
+      "logged_ceiling_passed": true
+    },
+    "G9": {
+      "status": "FAIL",
+      "S-CTRL_receipt_sha256": "fcca17fb54bbc1349409f8eeda4d81459a6174da2a8ed39a7bff4a28ada8ede5",
+      "S-SELF_receipt_sha256": "8c2b07d74fbd94dc7306fe6ea4835b327181809e819a4b0733ee66143c5a6461",
+      "range_violation_rate_S-CTRL": 0.31689453125,
+      "range_violation_rate_S-SELF": 0.24755859375,
+      "required_rate_max_exclusive": 0.05,
+      "nonfinite_reconstruction_reset_and_drift_checks_passed": true
+    },
+    "combined": {
+      "status": "FAIL",
+      "decision": "STOP",
+      "formal_training_authorized": false
+    }
+  },
+  "seal_policy": {
+    "action": "seal_negative_result_no_retry_no_gate_tuning",
+    "same_F2_retry_forbidden": true,
+    "seed_selection_forbidden": true,
+    "gate_threshold_tuning_forbidden": true,
+    "formal_9_run_forbidden": true,
+    "allowed_next_step": "Create a separately preregistered F3 experiment with new source/receipt/CAL/smoke identities while preserving this F2 result unchanged."
+  },
+  "internal_test": "sealed",
+  "internal_test_opened": false,
+  "recorded_at_utc": "2026-07-19T19:00:54Z"
+}
